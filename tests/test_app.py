@@ -2835,3 +2835,225 @@ class TestPauseJobsAutoDisable:
         )
         pause_flags = [a for a in plan.argv if "pause-immich-jobs" in a]
         assert len(pause_flags) == 1, f"Expected exactly one pause flag; got: {pause_flags}"
+
+
+# ==============================================================================
+# SECTION: CONFIG/PROFILE/LOCK RESILIENCE (corruption & crash safety)
+# ==============================================================================
+
+import stat
+
+from core.config_manager import _atomic_write_text
+from core.process_tracker import lock_dir, update_lock
+
+
+def test_corrupt_config_backed_up_and_flagged(tmp_path, monkeypatch):
+    """A corrupt config.toml must be backed up and surfaced, not silently replaced."""
+    cfg_file = tmp_path / "config.toml"
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(cfg_file))
+
+    corrupt_text = 'server = { url = "http://recover-me:2283"\nthis is [not valid toml'
+    cfg_file.write_text(corrupt_text, encoding="utf-8")
+
+    loaded = load_config()
+
+    # Defaults are returned, but the failure is visible to the caller.
+    assert loaded.server_url == ""
+    assert loaded.load_failed is True
+
+    backup = tmp_path / "config.toml.corrupt"
+    assert backup.exists()
+    assert backup.read_text(encoding="utf-8") == corrupt_text
+    assert loaded.load_backup_path == str(backup)
+
+    # A subsequent save must not destroy the backup.
+    save_config(AppConfig())
+    assert backup.read_text(encoding="utf-8") == corrupt_text
+
+    # After the save the config is valid again and no failure is reported.
+    reloaded = load_config()
+    assert reloaded.load_failed is False
+
+
+def test_corrupt_config_backup_not_overwritten(tmp_path, monkeypatch):
+    """The first backup holds the recoverable data and must never be clobbered."""
+    cfg_file = tmp_path / "config.toml"
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(cfg_file))
+
+    original_corrupt = "original [recoverable data"
+    cfg_file.write_text(original_corrupt, encoding="utf-8")
+    load_config()
+
+    cfg_file.write_text("different [garbage", encoding="utf-8")
+    load_config()
+
+    backup = tmp_path / "config.toml.corrupt"
+    assert backup.read_text(encoding="utf-8") == original_corrupt
+
+
+def test_missing_config_not_flagged_as_corrupt(tmp_path, monkeypatch):
+    """An absent config file is a normal first run, not a corruption event."""
+    cfg_file = tmp_path / "config.toml"
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(cfg_file))
+
+    loaded = load_config()
+    assert loaded.load_failed is False
+    assert not (tmp_path / "config.toml.corrupt").exists()
+
+
+def test_corrupt_profiles_index_backed_up_before_rebuild(tmp_path, monkeypatch):
+    """Corrupt profiles.toml must be preserved so registrations stay recoverable."""
+    cfg_dir = tmp_path / "config_dir"
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(cfg_dir / "config.toml"))
+
+    create_profile("work")
+    idx_path = cfg_dir / "profiles.toml"
+    assert "work" in idx_path.read_text(encoding="utf-8")
+
+    # Simulate a truncated/corrupted index that still contains the registration.
+    corrupt_text = idx_path.read_text(encoding="utf-8") + "\n[[broken"
+    idx_path.write_text(corrupt_text, encoding="utf-8")
+
+    profiles = list_profiles()
+    assert any(p.name == "default" for p in profiles)
+
+    backup = cfg_dir / "profiles.toml.corrupt"
+    assert backup.exists(), "corrupt profiles.toml must be backed up before rebuild"
+    assert backup.read_text(encoding="utf-8") == corrupt_text
+    assert "work" in backup.read_text(encoding="utf-8")
+
+
+def test_atomic_write_uses_random_tmp_and_fsync(tmp_path, monkeypatch):
+    """Writes must go through an unpredictable same-directory tmp file, fsync, and os.replace."""
+    target = tmp_path / "config.toml"
+    target.write_text("old content", encoding="utf-8")
+
+    fsync_calls = []
+    real_fsync = os.fsync
+
+    def spy_fsync(fd):
+        fsync_calls.append(fd)
+        return real_fsync(fd)
+
+    replace_calls = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        replace_calls.append((Path(src), Path(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("core.config_manager.os.fsync", spy_fsync)
+    monkeypatch.setattr("core.config_manager.os.replace", spy_replace)
+
+    _atomic_write_text(target, "new content", mode=0o644)
+
+    assert fsync_calls, "tmp file must be fsynced before os.replace"
+    assert replace_calls, "final write must go through os.replace"
+    src, dst = replace_calls[-1]
+    assert dst == target
+    assert src.parent == target.parent
+    assert src.name.startswith("config.toml.") and src.name.endswith(".tmp")
+    assert src.name != "config.toml.tmp", "tmp name must not be predictable"
+    assert target.read_text(encoding="utf-8") == "new content"
+
+
+def test_atomic_write_crash_leaves_target_intact(tmp_path, monkeypatch):
+    """A crash before os.replace must leave the target untouched and no tmp litter."""
+    target = tmp_path / "config.toml"
+    target.write_text("good content", encoding="utf-8")
+
+    def failing_replace(src, dst):
+        raise OSError("simulated crash")
+
+    monkeypatch.setattr("core.config_manager.os.replace", failing_replace)
+
+    with pytest.raises(OSError):
+        _atomic_write_text(target, "half-written", mode=0o644)
+
+    assert target.read_text(encoding="utf-8") == "good content"
+    assert list(tmp_path.glob("*.tmp")) == [], "failed write must not leave tmp files behind"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permissions only")
+def test_secrets_tmp_file_owner_only_from_creation(tmp_path, monkeypatch):
+    """The secrets tmp file must be 0600 from creation, never widened while it holds content."""
+    secrets_file = tmp_path / "secrets.toml"
+
+    observed_modes = []
+    real_chmod = os.chmod
+
+    def spy_chmod(path, mode, *args, **kwargs):
+        observed_modes.append(stat.S_IMODE(os.stat(path).st_mode))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("core.config_manager.os.chmod", spy_chmod)
+
+    old_umask = os.umask(0o022)
+    try:
+        save_secrets({"api_key": "s3cret"}, secrets_file)
+    finally:
+        os.umask(old_umask)
+
+    assert observed_modes, "expected the tmp file permissions to be set explicitly"
+    assert all(m == 0o600 for m in observed_modes), (
+        f"secrets tmp file was readable beyond owner before chmod: {[oct(m) for m in observed_modes]}"
+    )
+    assert stat.S_IMODE(secrets_file.stat().st_mode) == 0o600
+
+
+def test_lock_file_written_atomically(tmp_path, monkeypatch):
+    """Lock creation and updates must go through tmp + os.replace, never partial writes."""
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(tmp_path / "config.toml"))
+
+    replace_calls = []
+    real_replace = os.replace
+
+    def spy_replace(src, dst):
+        replace_calls.append(Path(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("core.config_manager.os.replace", spy_replace)
+
+    l_path = create_lock("upload-folder", "upload", "./immich-go")
+    assert l_path in replace_calls, "create_lock must write via os.replace"
+    assert read_lock(l_path) is not None
+
+    replace_calls.clear()
+    update_lock(l_path, shell_pid=os.getpid())
+    assert l_path in replace_calls, "update_lock must write via os.replace"
+    assert read_lock(l_path).shell_pid == os.getpid()
+
+    release_lock(l_path)
+
+
+def test_unparseable_lock_not_deleted_by_cleanup(tmp_path, monkeypatch):
+    """Cleanup must only delete locks that parse AND are provably stale."""
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(tmp_path / "config.toml"))
+    d = lock_dir()
+
+    garbage_lock = d / "run_garbage1.lock"
+    garbage_lock.write_text("{ not valid json", encoding="utf-8")
+
+    stale_lock = d / "run_stale001.lock"
+    stale_lock.write_text(
+        json.dumps(
+            {
+                "run_id": "stale001",
+                "gui_pid": 999999,
+                "started_at": "2020-01-01T00:00:00+00:00",
+                "tab_key": "upload-folder",
+                "command_summary": "upload",
+                "binary_path": "./immich-go",
+                "shell_pid": 999999,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cleaned = cleanup_stale_locks()
+    assert cleaned == 1, "only the provably stale lock may be cleaned"
+    assert not stale_lock.exists()
+    assert garbage_lock.exists(), "unparseable lock must not be deleted"
+
+    assert scan_locks() == []
+    assert garbage_lock.exists(), "scan_locks must not delete unparseable locks"

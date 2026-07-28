@@ -18,7 +18,7 @@ except ModuleNotFoundError:
 
 import tomli_w
 
-from .config_manager import SecretStore, _atomic_write_text, default_config_dir
+from .config_manager import SecretStore, _atomic_write_text, _backup_corrupt_file, default_config_dir
 
 
 @dataclass
@@ -98,6 +98,10 @@ def _load_profiles_index() -> dict:
         content = idx_path.read_text(encoding="utf-8")
         return tomllib.loads(content)
     except Exception:
+        # The index exists but is unreadable/corrupt: preserve it alongside so
+        # the profile registrations can be recovered, instead of letting the
+        # next save silently rebuild an index containing only 'default'.
+        _backup_corrupt_file(idx_path)
         return {}
 
 

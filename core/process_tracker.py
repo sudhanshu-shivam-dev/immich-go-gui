@@ -11,7 +11,7 @@ from pathlib import Path
 import sys
 import uuid
 
-from .config_manager import default_config_dir
+from .config_manager import _atomic_write_text, default_config_dir
 
 
 @dataclass
@@ -58,7 +58,7 @@ def create_lock(
     }
 
     text = json.dumps(data, indent=2)
-    l_path.write_text(text, encoding="utf-8")
+    _atomic_write_text(l_path, text, mode=0o644)
     return l_path
 
 
@@ -72,7 +72,7 @@ def update_lock(lock_path: Path, **fields) -> None:
         for k, v in fields.items():
             data[k] = v
         data["last_seen"] = datetime.now(timezone.utc).isoformat()
-        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        _atomic_write_text(p, json.dumps(data, indent=2), mode=0o644)
     except Exception:
         pass
 
@@ -209,10 +209,12 @@ def scan_locks() -> list[RunLock]:
 
     active_locks = []
     for p in d.glob("run_*.lock"):
+        lock = read_lock(p)
+        if lock is None:
+            # Unparseable lock: cannot be proven stale, so leave it alone.
+            continue
         if is_lock_active(p):
-            lock = read_lock(p)
-            if lock:
-                active_locks.append(lock)
+            active_locks.append(lock)
         else:
             release_lock(p)
 
@@ -227,6 +229,9 @@ def cleanup_stale_locks() -> int:
 
     cleaned = 0
     for p in d.glob("run_*.lock"):
+        if read_lock(p) is None:
+            # Unparseable lock: cannot be proven stale, so leave it alone.
+            continue
         if not is_lock_active(p):
             release_lock(p)
             cleaned += 1

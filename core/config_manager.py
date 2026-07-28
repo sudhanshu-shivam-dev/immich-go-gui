@@ -7,7 +7,9 @@ and plaintext secrets.toml) without PySide6 or Qt dependencies.
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
 import sys
+import tempfile
 from typing import Optional
 
 try:
@@ -167,18 +169,51 @@ def default_secrets_path(profile_name: str | None = None) -> Path:
 
 
 def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
-    """Atomically writes text to path and optionally sets POSIX permissions."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    """Atomically writes text to path and optionally sets POSIX permissions.
 
-    if mode is not None and os.name == "posix":
+    The temporary file is created in the target directory with an unpredictable
+    name and 0600 permissions from the start (via tempfile.mkstemp), then
+    flushed and fsynced before os.replace so concurrent readers never observe
+    partial content and a crash cannot leave a corrupt target.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+        if mode is not None and os.name == "posix":
+            try:
+                os.chmod(tmp, mode)
+            except OSError:
+                pass
+
+        os.replace(tmp, path)
+    except Exception:
         try:
-            os.chmod(tmp, mode)
+            tmp.unlink()
         except OSError:
             pass
+        raise
 
-    os.replace(tmp, path)
+
+def _backup_corrupt_file(path: Path) -> Path | None:
+    """Backs up an unreadable file alongside itself so a later save cannot destroy it.
+
+    An existing backup is never overwritten: the first backup is the one most
+    likely to still hold recoverable user data. Returns the backup path, or
+    None if the backup could not be created.
+    """
+    backup = path.with_name(path.name + ".corrupt")
+    try:
+        if not backup.exists():
+            shutil.copy2(path, backup)
+        return backup
+    except OSError:
+        return None
 
 
 def load_config(path: Path | None = None, profile_name: str | None = None) -> AppConfig:
@@ -197,6 +232,12 @@ def load_config(path: Path | None = None, profile_name: str | None = None) -> Ap
         content = path.read_text(encoding="utf-8")
         data = tomllib.loads(content)
     except Exception:
+        # The file exists but is unreadable/corrupt: preserve it next to the
+        # original before any subsequent save can overwrite it, and flag the
+        # condition so the GUI can inform the user.
+        backup = _backup_corrupt_file(path)
+        cfg.load_failed = True
+        cfg.load_backup_path = str(backup) if backup else ""
         return cfg
 
     cfg.schema_version = data.get("schema_version", 2)
