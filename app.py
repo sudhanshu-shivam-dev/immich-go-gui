@@ -692,7 +692,9 @@ class ImmichGoGUI(QMainWindow):
             row = AdvancedFlagRow(def_)
             row.enable.toggled.connect(lambda _, r=row: self.update_status())
             if hasattr(row.value_widget, "textChanged"):
-                row.value_widget.textChanged.connect(lambda _, r=row: self.update_status())
+                # textChanged emits a str on QLineEdit but nothing on
+                # QPlainTextEdit, so accept any arity here.
+                row.value_widget.textChanged.connect(lambda *_, r=row: self.update_status())
             elif hasattr(row.value_widget, "currentIndexChanged"):
                 row.value_widget.currentIndexChanged.connect(lambda _, r=row: self.update_status())
             elif hasattr(row.value_widget, "valueChanged"):
@@ -716,6 +718,8 @@ class ImmichGoGUI(QMainWindow):
         self.theme_mode = mode
         if hasattr(self, "settings"):
             self.settings.setValue("theme_mode", mode)
+        if hasattr(self, "app_config"):
+            self.app_config.theme_mode = mode
         if hasattr(self, "theme_mode_combo"):
             self.theme_mode_combo.blockSignals(True)
             self.theme_mode_combo.setCurrentText(mode)
@@ -1077,7 +1081,9 @@ class ImmichGoGUI(QMainWindow):
         self.binary_debounce = QTimer()
         self.binary_debounce.setSingleShot(True)
         self.binary_debounce.setInterval(400)
-        self.binary_debounce.timeout.connect(self._on_manual_binary_changed)
+        self.binary_debounce.timeout.connect(
+            lambda: self._on_manual_binary_changed(self.manual_binary_edit.text())
+        )
         self.manual_binary_edit.textChanged.connect(lambda: self.binary_debounce.start())
         manual_form.add_row(
             "Manual Binary Path",
@@ -1889,14 +1895,15 @@ class ImmichGoGUI(QMainWindow):
         self.is_advanced = checked
         if hasattr(self, "app_config"):
             self.app_config.advanced_mode = checked
-        if hasattr(self, "btn_mode"):
-            self.btn_mode.blockSignals(True)
-            self.btn_mode.setChecked(checked)
-            self.btn_mode.blockSignals(False)
+        if hasattr(self, "switch_advanced"):
+            self.switch_advanced.blockSignals(True)
+            self.switch_advanced.setChecked(checked)
+            self.switch_advanced.blockSignals(False)
         if hasattr(self, "lbl_mode"):
             self.lbl_mode.setText("Advanced" if checked else "Simple")
         for w in getattr(self, "adv_frames", []):
             w.setVisible(checked)
+        self.update_status()
 
     def switch_tab(self, index, crumb, btn):
         self.stacked_widget.setCurrentIndex(index)
@@ -1945,7 +1952,8 @@ class ImmichGoGUI(QMainWindow):
         menu_bar = self.menuBar()
         file_menu = menu_bar.addMenu("File")
         save_action = QAction("Save Configuration", self)
-        save_action.triggered.connect(self.save_configuration)
+        # triggered emits a checked bool; don't let it land in show_popup.
+        save_action.triggered.connect(lambda: self.save_configuration())
         file_menu.addAction(save_action)
         load_action = QAction("Load Configuration", self)
         load_action.triggered.connect(self.load_configuration)

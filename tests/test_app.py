@@ -3577,3 +3577,123 @@ def test_rename_profile_secret_copy_failure_leaves_old_profile_intact(tmp_path, 
 
     assert cfg_path.exists()
     assert not profile_dir("vacation").exists()
+
+
+# ==============================================================================
+# Group D: signal/slot wiring and dual-store regression tests
+# ==============================================================================
+
+from PySide6.QtCore import QSettings
+from theme import THEME_DARK, THEME_LIGHT
+from core.config_manager import SecretSaveResult
+
+
+def test_manual_binary_debounce_timer_invokes_handler(gui, tmp_path, monkeypatch):
+    """QTimer.timeout emits zero arguments: the debounce timer must still
+    deliver the current line-edit text to _on_manual_binary_changed."""
+    fake_bin = tmp_path / "immich-go"
+    fake_bin.write_text("#!/bin/sh\n")
+    fake_bin.chmod(0o755)
+
+    saved = {}
+    monkeypatch.setattr(
+        "app.load_binary_metadata",
+        lambda *a, **k: {"schema_version": 2, "selected_version": "", "manual_path": "", "versions": {}},
+    )
+    monkeypatch.setattr("app.save_binary_metadata", lambda m, *a, **k: saved.update(m))
+    monkeypatch.setattr("app.get_binary_path", lambda m=None, **k: m["manual_path"])
+
+    old_binary_path = gui.binary_path
+    gui.manual_binary_edit.blockSignals(True)
+    gui.manual_binary_edit.setText(str(fake_bin))
+    gui.manual_binary_edit.blockSignals(False)
+    try:
+        gui.binary_debounce.timeout.emit()
+        assert saved.get("manual_path") == str(fake_bin), (
+            "Firing the debounce timer never reached _on_manual_binary_changed"
+        )
+        assert gui.binary_path == str(fake_bin)
+    finally:
+        gui.binary_debounce.stop()
+        gui.manual_binary_edit.blockSignals(True)
+        gui.manual_binary_edit.setText("")
+        gui.manual_binary_edit.blockSignals(False)
+        gui.binary_path = old_binary_path
+
+
+def test_ban_file_plain_text_edit_keystroke_updates_status(gui, monkeypatch):
+    """QPlainTextEdit.textChanged emits zero arguments: typing in a
+    lines_repeat advanced row (--ban-file) must reach update_status."""
+    calls = []
+    monkeypatch.setattr(gui, "update_status", lambda: calls.append(True))
+
+    row = gui.adv_rows["upload-folder"]["ban-file"]
+    assert isinstance(row.value_widget, QPlainTextEdit)
+    try:
+        row.value_widget.setPlainText("*.MP~")
+        assert calls, "textChanged on the ban-file editor never reached update_status"
+    finally:
+        row.value_widget.blockSignals(True)
+        row.value_widget.setPlainText("")
+        row.value_widget.blockSignals(False)
+
+
+def test_save_configuration_menu_action_shows_popup(gui, tmp_path, monkeypatch):
+    """QAction.triggered emits a checked bool; the Save Configuration menu
+    entry must not let it land in show_popup, hiding keyring warnings."""
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setattr(
+        "app.save_secret_with_fallback",
+        lambda **kwargs: SecretSaveResult(ok=True, provider_used="secrets_file", message="fallback note"),
+    )
+
+    file_menu = next(a for a in gui.menuBar().actions() if a.text() == "File").menu()
+    save_action = next(a for a in file_menu.actions() if a.text() == "Save Configuration")
+
+    QMessageBox.information.reset_mock()
+    save_action.trigger()
+
+    assert QMessageBox.information.called, (
+        "Saving from the menu must show the popup carrying keyring-fallback warnings"
+    )
+    popup_text = QMessageBox.information.call_args[0][2]
+    assert "fallback note" in popup_text
+
+
+def test_apply_theme_updates_app_config_and_persists(gui, tmp_path, monkeypatch):
+    """Choosing a theme must update app_config.theme_mode so the choice
+    survives a save/load roundtrip instead of reverting on restart."""
+    monkeypatch.setenv("IMMICH_GO_GUI_CONFIG", str(tmp_path / "config.toml"))
+    monkeypatch.setattr(
+        gui, "settings",
+        QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat),
+    )
+
+    previous = gui.theme_mode
+    target = THEME_DARK if previous != THEME_DARK else THEME_LIGHT
+    try:
+        gui.theme_mode_combo.setCurrentText(target)
+        assert gui.app_config.theme_mode == target
+
+        save_config(gui.app_config)
+        assert load_config().theme_mode == target
+    finally:
+        gui.apply_theme(previous)
+
+
+def test_toggle_advanced_syncs_switch_and_refreshes_status(gui, monkeypatch):
+    """Programmatic toggling must sync the header switch and refresh status."""
+    status_calls = []
+    monkeypatch.setattr(gui, "update_status", lambda: status_calls.append(True))
+
+    try:
+        gui.toggle_advanced(True)
+        assert gui.switch_advanced.isChecked() is True, (
+            "toggle_advanced must sync the switch_advanced state"
+        )
+        assert status_calls, "toggle_advanced must call update_status"
+    finally:
+        gui.toggle_advanced(False)
+    assert gui.switch_advanced.isChecked() is False
