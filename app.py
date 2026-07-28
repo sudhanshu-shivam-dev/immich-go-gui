@@ -3259,6 +3259,19 @@ class ImmichGoGUI(QMainWindow):
             self._migrate_legacy_qsettings_to_config()
             self.app_config = load_config()
 
+        if self.app_config.load_failed:
+            backup_note = (
+                f"A backup of the unreadable file was saved to:\n{self.app_config.load_backup_path}"
+                if self.app_config.load_backup_path
+                else "The unreadable file could not be backed up."
+            )
+            QMessageBox.warning(
+                self,
+                "Configuration Could Not Be Read",
+                "The configuration file is unreadable, so default settings were "
+                f"loaded.\n\n{backup_note}",
+            )
+
         self.inputs["config"]["server"].setText(self.app_config.server_url)
 
         if "skip-ssl" in self.inputs["config"]:

@@ -92,3 +92,8 @@ class AppConfig:
     pause_immich_jobs: bool = True
 
     form_state: dict = field(default_factory=dict)
+
+    # Runtime-only load diagnostics (never persisted by save_config): set when
+    # the config file existed but could not be parsed, so defaults were used.
+    load_failed: bool = False
+    load_backup_path: str = ""
