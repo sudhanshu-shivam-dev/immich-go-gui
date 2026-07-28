@@ -2868,6 +2868,7 @@ class TestLauncherScriptGeneration:
         Terminal.app does not inherit the environment passed to Popen, so
         without export lines in the script immich-go runs unauthenticated.
         """
+        import shutil
         import subprocess as _sp
 
         monkeypatch.setattr("sys.platform", "darwin")
@@ -2895,8 +2896,10 @@ class TestLauncherScriptGeneration:
         assert "export IMMICH_GO_UPLOAD_SERVER='http://localhost:2283'" in content
         assert "export IMMICH_GO_UPLOAD_API_KEY=" in content
 
-        # The script (which contains secrets) must be private.
-        assert run_sh.stat().st_mode & 0o777 == 0o700
+        # The script (which contains secrets) must be private. POSIX-only:
+        # Windows filesystems do not carry POSIX permission bits.
+        if os.name == "posix":
+            assert run_sh.stat().st_mode & 0o777 == 0o700
 
         # Round-trip the export lines through a real shell to prove that a
         # value with single quotes and spaces survives the quoting.
@@ -2904,13 +2907,14 @@ class TestLauncherScriptGeneration:
             line for line in content.splitlines() if line.startswith("export IMMICH_GO_")
         ]
         assert len(export_lines) == 2
-        out = _sp.run(
-            ["bash", "-c", "\n".join(export_lines) + '\nprintf %s "$IMMICH_GO_UPLOAD_API_KEY"'],
-            capture_output=True,
-            text=True,
-        )
-        assert out.returncode == 0
-        assert out.stdout == tricky_val
+        if shutil.which("bash"):
+            out = _sp.run(
+                ["bash", "-c", "\n".join(export_lines) + '\nprintf %s "$IMMICH_GO_UPLOAD_API_KEY"'],
+                capture_output=True,
+                text=True,
+            )
+            assert out.returncode == 0
+            assert out.stdout == tricky_val
 
     def test_linux_script_has_no_export_lines(self, tmp_path, monkeypatch):
         """Linux terminals inherit the Popen env — secrets stay out of run.sh."""
@@ -2995,6 +2999,9 @@ class TestLauncherScriptGeneration:
     def test_scripts_use_absolute_binary_path(self, tmp_path, monkeypatch, platform):
         """The scripts cd away from the GUI's cwd before running, so a
         relative binary path like ./immich-go must be written as absolute."""
+        import shlex
+        import subprocess as _sp
+
         monkeypatch.setattr("sys.platform", platform)
         monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
         monkeypatch.chdir(tmp_path)
@@ -3011,11 +3018,21 @@ class TestLauncherScriptGeneration:
             )
 
         assert res.ok
+        # Build the expected command line exactly the way the launcher does,
+        # so the test holds on any host OS (shlex.quote wraps Windows-style
+        # absolute paths in quotes; list2cmdline does not).
         if platform == "win32":
             content = lock_path.with_suffix(".bat").read_text(encoding="utf-8")
+            expected_line = _sp.list2cmdline(
+                [expected_binary, "upload", "from-folder", "/photos"]
+            ).replace("%", "%%")
         else:
             content = self._find_run_sh(tmp_path).read_text(encoding="utf-8")
+            expected_line = " ".join(
+                shlex.quote(c)
+                for c in [expected_binary, "upload", "from-folder", "/photos"]
+            )
         lines = content.splitlines()
 
-        assert f"{expected_binary} upload from-folder /photos" in lines
+        assert expected_line in lines
         assert "./immich-go upload from-folder /photos" not in lines
