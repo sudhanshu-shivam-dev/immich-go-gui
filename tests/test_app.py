@@ -1,3 +1,4 @@
+import copy
 import pytest
 import os
 import sys
@@ -20,7 +21,14 @@ from app import (
     save_binary_metadata,
     get_binary_path,
 )
-from PySide6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QLineEdit,
+    QPlainTextEdit,
+    QSpinBox,
+)
 from PySide6.QtCore import QUrl, Qt, QMimeData, QPointF
 from PySide6.QtGui import QDropEvent
 
@@ -184,11 +192,93 @@ def test_build_environment_upload_immich(gui):
 # ==============================================================================
 
 @pytest.fixture(scope="session")
-def qapp():
+def qapp(_isolated_environment):
     app = QApplication.instance()
     if app is None:
         app = QApplication([])
     yield app
+
+
+def _widget_state(widget):
+    if isinstance(widget, QLineEdit):
+        return ("text", widget.text())
+    if isinstance(widget, QPlainTextEdit):
+        return ("plain", widget.toPlainText())
+    if isinstance(widget, QCheckBox):
+        return ("checked", widget.isChecked())
+    if isinstance(widget, QComboBox):
+        return ("index", widget.currentIndex())
+    if isinstance(widget, QSpinBox):
+        return ("value", widget.value())
+    return None
+
+
+def _apply_widget_state(widget, state):
+    kind, value = state
+    widget.blockSignals(True)
+    try:
+        if kind == "text":
+            widget.setText(value)
+        elif kind == "plain":
+            widget.setPlainText(value)
+        elif kind == "checked":
+            widget.setChecked(value)
+        elif kind == "index":
+            widget.setCurrentIndex(value)
+        elif kind == "value":
+            widget.setValue(value)
+    finally:
+        widget.blockSignals(False)
+
+
+def _capture_gui_state(g):
+    """Snapshots the freshly constructed GUI so each test can be reset to it."""
+    return {
+        "inputs": {
+            (tab_key, k): _widget_state(w)
+            for tab_key, widgets in g.inputs.items()
+            for k, w in widgets.items()
+            if _widget_state(w) is not None
+        },
+        "advanced": {
+            (tab_key, k): row.state()
+            for tab_key, rows in g.adv_rows.items()
+            for k, row in rows.items()
+        },
+        "indices": (
+            g.stacked_widget.currentIndex(),
+            g.upload_tabs.currentIndex(),
+            g.archive_tabs.currentIndex(),
+        ),
+        "is_advanced": g.is_advanced,
+        "binary_path": g.binary_path,
+        "app_config": copy.deepcopy(g.app_config),
+    }
+
+
+def _restore_gui_state(g, snapshot):
+    """Deterministically restores widgets, config, and run state from the snapshot."""
+    for (tab_key, k), state in snapshot["inputs"].items():
+        _apply_widget_state(g.inputs[tab_key][k], state)
+    for (tab_key, k), state in snapshot["advanced"].items():
+        g.adv_rows[tab_key][k].set_state(dict(state))
+    for widget, index in zip(
+        (g.stacked_widget, g.upload_tabs, g.archive_tabs), snapshot["indices"]
+    ):
+        widget.blockSignals(True)
+        try:
+            widget.setCurrentIndex(index)
+        finally:
+            widget.blockSignals(False)
+    g.app_config = copy.deepcopy(snapshot["app_config"])
+    g.toggle_advanced(snapshot["is_advanced"])
+    g.binary_path = snapshot["binary_path"]
+    g.active_lock_path = None
+    g.running_process = False
+    g._last_conn_test_ok = None
+    if hasattr(g, "check_process_timer"):
+        g.check_process_timer.stop()
+    g.update_status()
 
 
 @pytest.fixture(scope="session")
@@ -197,6 +287,7 @@ def gui(qapp):
          patch.object(ImmichGoGUI, "load_configuration"):
         g = ImmichGoGUI()
         g.binary_path = "./immich-go"
+        g._pristine_state = _capture_gui_state(g)
         yield g
         g.close()
 
@@ -212,13 +303,14 @@ def suppress_qt_dialogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _reset_shared_config(gui):
-    cfg = gui.inputs["config"]
-    cfg["skip-ssl"].setChecked(False)
-    cfg["client_timeout"].setValue(20)
-    cfg["device_uuid"].setText("")
-    cfg["on_errors"].setCurrentText("stop")
-    cfg["concurrent"].setValue(min(max(os.cpu_count() or 2, 1), 20))
+def _reset_gui_state(gui):
+    """Restores the session-scoped GUI to its pristine state before each test.
+
+    Constructing ImmichGoGUI is expensive, so the gui fixture stays
+    session-scoped; this full reset (widgets, advanced rows, page indices,
+    config, run state) keeps tests from observing state left by earlier tests.
+    """
+    _restore_gui_state(gui, gui._pristine_state)
     yield
 
 
@@ -1540,6 +1632,7 @@ def test_plan_errors_surfaced_in_gui(gui):
     gui.upload_tabs.setCurrentIndex(0)
     gui.inputs["config"]["server"].setText("http://local:2283")
     gui.inputs["config"]["api_key"].setText("key")
+    gui.inputs["upload-folder"]["path"].setText("/photos")
 
     mock_plan = CommandPlan(
         argv=["upload", "from-folder"],
@@ -3057,3 +3150,105 @@ def test_unparseable_lock_not_deleted_by_cleanup(tmp_path, monkeypatch):
 
     assert scan_locks() == []
     assert garbage_lock.exists(), "scan_locks must not delete unparseable locks"
+
+
+# ==============================================================================
+# SECTION: TEST HERMETICITY REGRESSION TESTS
+# The suite must never touch the real HOME/config/lock dir/OS keyring, and
+# tests must not observe GUI state leaked by earlier tests (see conftest.py).
+# ==============================================================================
+
+from core.config_manager import default_config_dir, default_config_path
+from core.process_tracker import lock_dir
+
+
+def test_config_and_lock_paths_resolve_inside_isolated_home(isolated_home):
+    """Config and lock paths must resolve inside the per-session tmp home."""
+    assert default_config_dir().is_relative_to(isolated_home)
+    assert default_config_path().is_relative_to(isolated_home)
+    assert lock_dir().is_relative_to(isolated_home)
+
+
+def test_reset_all_locks_operates_on_isolated_lock_dir(gui, isolated_home):
+    """on_reset_run_state_clicked must clear locks in the isolated dir only."""
+    lock_path = create_lock("upload-folder", "upload from-folder", "./immich-go")
+    assert lock_path.is_relative_to(isolated_home)
+
+    gui.running_process = True
+    gui.on_reset_run_state_clicked()
+
+    assert not lock_path.exists()
+    assert gui.running_process is False
+    assert gui.active_lock_path is None
+
+
+def test_save_configuration_writes_config_inside_isolated_home(gui, isolated_home):
+    """save_configuration must write config.toml inside the isolated home."""
+    gui.inputs["config"]["server"].setText("http://hermetic:2283")
+    gui.save_configuration(show_popup=False)
+
+    cfg_path = default_config_path()
+    assert cfg_path.is_relative_to(isolated_home)
+    assert cfg_path.exists()
+    assert "http://hermetic:2283" in cfg_path.read_text(encoding="utf-8")
+
+
+def test_save_configuration_stores_secrets_in_fake_keyring(gui, fake_keyring):
+    """save_configuration must write API keys to the in-memory keyring backend."""
+    gui.inputs["config"]["api_key"].setText("hermetic-api-secret")
+    gui.inputs["config"]["admin_api_key"].setText("hermetic-admin-secret")
+    gui.save_configuration(show_popup=False)
+
+    assert fake_keyring.store[("immich-go-gui", "default:api_key")] == "hermetic-api-secret"
+    assert fake_keyring.store[("immich-go-gui", "default:admin_api_key")] == "hermetic-admin-secret"
+
+
+def test_secret_store_round_trips_through_fake_keyring(fake_keyring):
+    """SecretStore must round-trip through the in-memory keyring backend."""
+    assert SecretStore.set_secret("default", "api_key", "in-memory-secret") is True
+    assert fake_keyring.store[("immich-go-gui", "default:api_key")] == "in-memory-secret"
+    assert SecretStore.get_secret("default", "api_key") == "in-memory-secret"
+
+    SecretStore.clear_secret("default", "api_key")
+    assert ("immich-go-gui", "default:api_key") not in fake_keyring.store
+
+
+def test_keyring_store_isolation_part_one(fake_keyring):
+    """First half of the keyring-isolation pair: store a secret."""
+    SecretStore.set_secret("default", "api_key", "leak-check")
+    assert SecretStore.get_secret("default", "api_key") == "leak-check"
+
+
+def test_keyring_store_isolation_part_two(fake_keyring):
+    """Second half: the previous test's secret must not be visible."""
+    assert fake_keyring.store == {}
+    assert SecretStore.get_secret("default", "api_key") == ""
+
+
+def test_gui_state_reset_part_one(gui):
+    """First half of the state-isolation pair: deliberately dirty the GUI."""
+    gui.toggle_advanced(True)
+    gui.stacked_widget.setCurrentIndex(3)
+    gui.inputs["config"]["server"].setText("http://leaked:2283")
+    gui.inputs["config"]["api_key"].setText("leaked-key")
+    gui.inputs["config"]["skip-ssl"].setChecked(True)
+    gui.inputs["upload-folder"]["path"].setText("/leaked/path")
+    gui.adv_rows["upload-folder"]["time-zone"].set_state({"enabled": True, "value": "UTC"})
+    gui.app_config.server_url = "http://leaked:2283"
+    gui._last_conn_test_ok = False
+    assert gui.is_advanced is True
+
+
+def test_gui_state_reset_part_two(gui):
+    """Second half: none of the previous test's mutations may be visible."""
+    assert gui.is_advanced is False
+    assert gui.stacked_widget.currentIndex() == 0
+    assert gui.inputs["config"]["server"].text() == ""
+    assert gui.inputs["config"]["api_key"].text() == ""
+    assert gui.inputs["config"]["skip-ssl"].isChecked() is False
+    assert gui.inputs["upload-folder"]["path"].text() == ""
+    row = gui.adv_rows["upload-folder"]["time-zone"]
+    assert row.enable.isChecked() is False
+    assert row.get_value() == ""
+    assert gui.app_config.server_url == ""
+    assert gui._last_conn_test_ok is None
