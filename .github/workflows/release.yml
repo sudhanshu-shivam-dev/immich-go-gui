@@ -24,10 +24,18 @@ jobs:
         include:
           - os: ubuntu-22.04
             name: linux
+            artifact: linux
           - os: windows-latest
             name: windows
+            artifact: windows
           - os: macos-latest
             name: macos
+            arch: arm64
+            artifact: macos-arm64
+          - os: macos-15-intel
+            name: macos
+            arch: x86_64
+            artifact: macos-x86_64
 
     steps:
       - name: Checkout Code
@@ -94,8 +102,10 @@ jobs:
         run: |
           uv run python -m nuitka --standalone --enable-plugin=pyside6 --output-filename=Immich-Go-GUI --include-data-files=immich-go-gui.png=immich-go-gui.png --include-data-dir=assets=assets app.py
           npm install -g create-dmg
-          create-dmg app.app || true
-          mv *.dmg "Immich-Go-GUI-${{ env.VERSION }}-macOS-x86_64.dmg" || true
+          # create-dmg exits non-zero when there is no signing identity but still
+          # produces the DMG; tolerate that, then fail hard if no DMG exists.
+          create-dmg app.app || echo "create-dmg exited non-zero (expected for unsigned builds)"
+          mv *.dmg "Immich-Go-GUI-${{ env.VERSION }}-macOS-${{ matrix.arch }}.dmg"
 
       # --- LINUX BUILD ---
       - name: Build Linux Standalone
@@ -156,12 +166,12 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: Immich-Go-GUI-${{ matrix.name }}
+          name: Immich-Go-GUI-${{ matrix.artifact }}
           if-no-files-found: error
           path: |
             Immich-Go-GUI-${{ env.VERSION }}-Windows-x86_64-Setup.exe
             Immich-Go-GUI-${{ env.VERSION }}-Windows-x86_64-Portable.zip
-            Immich-Go-GUI-${{ env.VERSION }}-macOS-x86_64.dmg
+            Immich-Go-GUI-${{ env.VERSION }}-macOS-*.dmg
             Immich-Go-GUI-${{ env.VERSION }}-Linux-x86_64.AppImage
             Immich-Go-GUI-${{ env.VERSION }}-Linux-x86_64-Portable.tar.gz
             Immich-Go-GUI-${{ env.VERSION }}-Linux-x86_64.deb
@@ -186,7 +196,7 @@ jobs:
           files: |
             artifacts/Immich-Go-GUI-*-Windows-x86_64-Setup.exe
             artifacts/Immich-Go-GUI-*-Windows-x86_64-Portable.zip
-            artifacts/Immich-Go-GUI-*-macOS-x86_64.dmg
+            artifacts/Immich-Go-GUI-*-macOS-*.dmg
             artifacts/Immich-Go-GUI-*-Linux-x86_64.AppImage
             artifacts/Immich-Go-GUI-*-Linux-x86_64-Portable.tar.gz
             artifacts/Immich-Go-GUI-*-Linux-x86_64.deb
@@ -202,7 +212,7 @@ jobs:
           files: |
             artifacts/Immich-Go-GUI-*-Windows-x86_64-Setup.exe
             artifacts/Immich-Go-GUI-*-Windows-x86_64-Portable.zip
-            artifacts/Immich-Go-GUI-*-macOS-x86_64.dmg
+            artifacts/Immich-Go-GUI-*-macOS-*.dmg
             artifacts/Immich-Go-GUI-*-Linux-x86_64.AppImage
             artifacts/Immich-Go-GUI-*-Linux-x86_64-Portable.tar.gz
             artifacts/Immich-Go-GUI-*-Linux-x86_64.deb
