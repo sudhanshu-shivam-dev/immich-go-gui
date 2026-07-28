@@ -601,6 +601,10 @@ class ImmichGoGUI(QMainWindow):
         self.stacked_widget.addWidget(self.archive_page)
         self.stacked_widget.addWidget(self.stack_tab)
 
+        # Snapshot of the pristine widget values, used to reset the form
+        # before a profile's saved state is applied.
+        self._default_form_state = self.collect_form_state()
+
         self.stacked_widget.setCurrentIndex(0)
         self.update_header_crumb("configuration")
         self.footer.setVisible(False)
@@ -2186,6 +2190,10 @@ class ImmichGoGUI(QMainWindow):
                 return
             try:
                 rename_profile(active, clean_n)
+                # Point the in-memory config at the renamed profile so later
+                # saves and secret lookups target the new name instead of
+                # recreating the old profile directory.
+                self.app_config.profile_name = clean_n
                 self.update_profiles_menu()
                 self.update_window_title()
             except Exception as e:
@@ -2261,6 +2269,26 @@ class ImmichGoGUI(QMainWindow):
             fields_state = state
             advanced_state = {}
 
+        # Reset all inputs and advanced flag rows to their defaults first, so
+        # fields absent from the loaded state (e.g. a brand-new profile with an
+        # empty form_state) don't keep values from the previously loaded profile.
+        defaults = getattr(self, "_default_form_state", None)
+        if defaults:
+            self._apply_fields_state(defaults.get("fields", {}))
+            self.reset_advanced_flags()
+
+        self._apply_fields_state(fields_state)
+
+        if isinstance(advanced_state, dict):
+            for tab_key, tab_adv in advanced_state.items():
+                rows = getattr(self, "adv_rows", {}).get(tab_key, {})
+                if isinstance(tab_adv, dict):
+                    for k, row_state in tab_adv.items():
+                        row = rows.get(k)
+                        if row is not None and isinstance(row_state, dict):
+                            row.set_state(row_state)
+
+    def _apply_fields_state(self, fields_state: dict) -> None:
         secret_keys = {"api_key", "from-api-key", "admin_api_key", "from-admin-api-key", "target-server"}
         for tab_key, tab_dict in fields_state.items():
             if tab_key in self.inputs and isinstance(tab_dict, dict):
@@ -2285,15 +2313,6 @@ class ImmichGoGUI(QMainWindow):
                     finally:
                         widget.blockSignals(False)
 
-        if isinstance(advanced_state, dict):
-            for tab_key, tab_adv in advanced_state.items():
-                rows = getattr(self, "adv_rows", {}).get(tab_key, {})
-                if isinstance(tab_adv, dict):
-                    for k, row_state in tab_adv.items():
-                        row = rows.get(k)
-                        if row is not None and isinstance(row_state, dict):
-                            row.set_state(row_state)
-
     def _confirm_reset_advanced_flags(self):
         reply = QMessageBox.question(
             self,
@@ -2308,13 +2327,14 @@ class ImmichGoGUI(QMainWindow):
     def reset_advanced_flags(self, tab_key: str | None = None):
         """Resets advanced flag enable checkboxes to False and values to defaults."""
         tabs = [tab_key] if tab_key else list(getattr(self, "adv_rows", {}).keys())
+        default_adv = getattr(self, "_default_form_state", {}).get("advanced", {})
 
         for t in tabs:
-            for row in getattr(self, "adv_rows", {}).get(t, {}).values():
-                row.set_state({
-                    "enabled": False,
-                    "value": row.def_.default,
-                })
+            for k, row in getattr(self, "adv_rows", {}).get(t, {}).items():
+                row.set_state(
+                    default_adv.get(t, {}).get(k)
+                    or {"enabled": False, "value": row.def_.default}
+                )
 
         self.update_status()
 
@@ -3259,6 +3279,10 @@ class ImmichGoGUI(QMainWindow):
             self._migrate_legacy_qsettings_to_config()
             self.app_config = load_config()
 
+        # Apply the saved form state first (this resets the whole form to
+        # defaults), then let the explicit config values below take precedence.
+        self.apply_form_state(self.app_config.form_state)
+
         self.inputs["config"]["server"].setText(self.app_config.server_url)
 
         if "skip-ssl" in self.inputs["config"]:
@@ -3329,8 +3353,6 @@ class ImmichGoGUI(QMainWindow):
             self.inputs["config"]["pause_jobs"].setChecked(
                 self.app_config.pause_immich_jobs
             )
-
-        self.apply_form_state(self.app_config.form_state)
 
         self.theme_mode = normalize_theme_mode(self.app_config.theme_mode)
 

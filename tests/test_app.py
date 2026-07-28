@@ -2835,3 +2835,127 @@ class TestPauseJobsAutoDisable:
         )
         pause_flags = [a for a in plan.argv if "pause-immich-jobs" in a]
         assert len(pause_flags) == 1, f"Expected exactly one pause flag; got: {pause_flags}"
+
+
+# ==============================================================================
+# SECTION: PROFILE STATE INTEGRITY
+# Cross-profile form-state bleed + rename desync regressions
+# ==============================================================================
+
+
+def _install_fake_keyring(monkeypatch, store):
+    monkeypatch.setattr(
+        "core.config_manager.keyring.set_password",
+        lambda service, user, value: store.__setitem__(user, value),
+    )
+    monkeypatch.setattr(
+        "core.config_manager.keyring.get_password",
+        lambda service, user: store.get(user),
+    )
+    monkeypatch.setattr(
+        "core.config_manager.keyring.delete_password",
+        lambda service, user: store.pop(user, None),
+    )
+
+
+def test_fresh_profile_does_not_inherit_previous_form_state(gui, tmp_path):
+    """Loading a profile with an empty form_state must reset every field left
+    over from the previously loaded profile (cross-profile state bleed)."""
+    # Profile A: populate simple fields and an advanced flag row
+    gui.inputs["upload-folder"]["path"].setText("/profile-a/photos")
+    gui.inputs["upload-folder"]["into-album"].setText("Profile A Album")
+    gui.inputs["upload-folder"]["folder-album"].setCurrentText("PATH")
+    gui.inputs["upload-gp"]["path"].setPlainText("/profile-a/takeout-001.zip")
+    gui.adv_rows["upload-folder"]["time-zone"].set_state({
+        "enabled": True,
+        "value": "America/New_York",
+    })
+
+    # A brand-new profile loads with form_state == {}
+    gui.apply_form_state({})
+
+    assert gui.inputs["upload-folder"]["path"].text() == ""
+    assert gui.inputs["upload-folder"]["into-album"].text() == ""
+    assert gui.inputs["upload-folder"]["folder-album"].currentText() == "NONE"
+    assert gui.inputs["upload-gp"]["path"].toPlainText() == ""
+    assert gui.adv_rows["upload-folder"]["time-zone"].enable.isChecked() is False
+
+    # Saving the new profile must not persist the old profile's values
+    cfg = AppConfig()
+    cfg.form_state = gui.collect_form_state()
+    cfg_path = tmp_path / "profiles" / "fresh" / "config.toml"
+    save_config(cfg, path=cfg_path)
+    saved_text = cfg_path.read_text(encoding="utf-8")
+    assert "/profile-a" not in saved_text
+    assert "Profile A Album" not in saved_text
+    assert "America/New_York" not in saved_text
+
+
+def test_rename_active_profile_saves_under_new_name(gui, tmp_path, monkeypatch):
+    """After renaming the active profile, saves must target the new profile
+    directory and keyring identity instead of recreating the old one."""
+    from core.profile_manager import profile_dir
+
+    monkeypatch.delenv("IMMICH_GO_GUI_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    store = {}
+    _install_fake_keyring(monkeypatch, store)
+
+    create_profile("travel")
+    set_active_profile_name("travel")
+    orig_config = gui.app_config
+    gui.app_config = load_config()
+    assert gui.app_config.profile_name == "travel"
+
+    monkeypatch.setattr(
+        "PySide6.QtWidgets.QInputDialog.getText",
+        MagicMock(return_value=("vacation", True)),
+    )
+    gui.on_rename_profile_clicked()
+
+    assert active_profile_name() == "vacation"
+    assert gui.app_config.profile_name == "vacation"
+
+    # A save after the rename must land under the new profile directory
+    gui.inputs["config"]["server"].setText("http://renamed:2283")
+    gui.inputs["config"]["api_key"].setText("renamed-key")
+    gui.save_configuration(show_popup=False)
+
+    new_cfg = profile_dir("vacation") / "config.toml"
+    assert new_cfg.exists()
+    assert "http://renamed:2283" in new_cfg.read_text(encoding="utf-8")
+    # The old profile directory must not be recreated as a zombie
+    assert not profile_dir("travel").exists()
+    # The secret was saved under the new keyring identity
+    assert store.get("vacation:api_key") == "renamed-key"
+
+    gui.app_config = orig_config
+
+
+def test_rename_profile_secret_copy_failure_leaves_old_profile_intact(tmp_path, monkeypatch):
+    """A failed keyring secret copy must abort the rename before the profile
+    directory is touched, leaving the old profile fully intact."""
+    from core.profile_manager import profile_dir
+
+    monkeypatch.delenv("IMMICH_GO_GUI_CONFIG", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+
+    def failing_set(service, user, value):
+        raise RuntimeError("Keyring unavailable")
+
+    monkeypatch.setattr("core.config_manager.keyring.set_password", failing_set)
+    monkeypatch.setattr(
+        "core.config_manager.keyring.get_password",
+        lambda service, user: "travel-secret" if user == "travel:api_key" else None,
+    )
+    monkeypatch.setattr("core.config_manager.keyring.delete_password", lambda service, user: None)
+
+    create_profile("travel")
+    cfg_path = profile_dir("travel") / "config.toml"
+    cfg_path.write_text("schema_version = 2\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError):
+        rename_profile("travel", "vacation")
+
+    assert cfg_path.exists()
+    assert not profile_dir("vacation").exists()
