@@ -3697,3 +3697,148 @@ def test_toggle_advanced_syncs_switch_and_refreshes_status(gui, monkeypatch):
     finally:
         gui.toggle_advanced(False)
     assert gui.switch_advanced.isChecked() is False
+
+
+# ==============================================================================
+# ALBUM FLAG REGRESSION TESTS (folder-as-album / into-album silently dropped)
+# ==============================================================================
+
+
+def test_build_plan_from_state_upload_picasa_album_flags_golden():
+    """Regression: the upload-picasa branch dropped --folder-as-album/--into-album."""
+    config_state = {
+        "server": "http://localhost:2283",
+        "api_key": "test-key",
+        "admin_api_key": "admin-key",  # prevent auto-disable of pause-immich-jobs
+    }
+
+    tab_state = {
+        "path": "/photos/picasa",
+        "folder-album": "FOLDER",
+        "into-album": "Picasa Archive",
+        "manage-burst": "NoStack",
+        "manage-raw-jpeg": "NoStack",
+        "manage-heic-jpeg": "NoStack",
+    }
+
+    plan = build_plan_from_state(
+        tab_key="upload-picasa",
+        config_state=config_state,
+        tab_state=tab_state,
+        binary_path="./immich-go",
+        dry_run=False,
+        base_env={},
+    )
+
+    assert _norm_argv(plan.argv) == _norm_argv([
+        "upload",
+        "from-picasa",
+        "--server=http://localhost:2283",
+        "--folder-as-album=FOLDER",
+        "--into-album=Picasa Archive",
+        "/photos/picasa",
+    ])
+
+
+def test_golden_upload_picasa_simple_album_widgets(gui):
+    """Regression: simple-mode picasa album widgets must reach the argv."""
+    gui.toggle_advanced(False)
+    gui.stacked_widget.setCurrentIndex(1)
+    gui.upload_tabs.setCurrentIndex(3)
+    gui.inputs["config"]["server"].setText("http://localhost:2283")
+    gui.inputs["config"]["api_key"].setText("key")
+    gui.inputs["config"]["admin_api_key"].setText("admin-key")  # prevent auto-disable
+    gui.inputs["upload-picasa"]["path"].setText("/photos/picasa")
+    gui.inputs["upload-picasa"]["folder-album"].setCurrentText("FOLDER")
+    gui.inputs["upload-picasa"]["into-album"].setText("Picasa Archive")
+
+    try:
+        plan = gui.build_plan(dry_run=False)
+    finally:
+        gui.inputs["upload-picasa"]["folder-album"].setCurrentText("NONE")
+        gui.inputs["upload-picasa"]["into-album"].setText("")
+
+    assert _norm_argv(plan.argv) == _norm_argv([
+        "upload", "from-picasa",
+        "--server=http://localhost:2283",
+        "--folder-as-album=FOLDER",
+        "--into-album=Picasa Archive",
+        "/photos/picasa",
+    ])
+
+
+def test_golden_upload_folder_into_album_widget(gui):
+    """Regression: the upload-folder into-album widget was never read into state."""
+    gui.toggle_advanced(False)
+    gui.stacked_widget.setCurrentIndex(1)
+    gui.upload_tabs.setCurrentIndex(0)
+    gui.inputs["config"]["server"].setText("http://localhost:2283")
+    gui.inputs["config"]["api_key"].setText("key")
+    gui.inputs["config"]["admin_api_key"].setText("admin-key")  # prevent auto-disable
+    gui.inputs["upload-folder"]["path"].setText("/photos")
+    gui.inputs["upload-folder"]["folder-album"].setCurrentText("NONE")
+    gui.inputs["upload-folder"]["into-album"].setText("Family Archive")
+
+    try:
+        plan = gui.build_plan(dry_run=False)
+    finally:
+        gui.inputs["upload-folder"]["into-album"].setText("")
+
+    assert _norm_argv(plan.argv) == _norm_argv([
+        "upload", "from-folder",
+        "--server=http://localhost:2283",
+        "--into-album=Family Archive",
+        "/photos",
+    ])
+
+
+def test_advanced_flag_keys_unique_per_tab_registry():
+    """Advanced-flag state keys must be unique within each tab's registry."""
+    from core.advanced_flags import ADVANCED_FLAGS
+
+    for tab, defs in ADVANCED_FLAGS.items():
+        keys = [def_.key for def_ in defs]
+        assert len(keys) == len(set(keys)), f"Duplicate advanced keys in '{tab}': {keys}"
+
+
+def test_advanced_flag_keys_do_not_collide_with_tab_state(gui):
+    """Advanced-flag keys must not collide with simple-mode tab-state keys.
+
+    _collect_tab_state strips every ADVANCED_KEYS entry from the tab state in
+    simple mode, so a collision makes the simple-mode widget dead (upload-picasa
+    album widgets, see the key rename in core/advanced_flags.py).
+    """
+    from core.advanced_flags import ADVANCED_FLAGS
+
+    for tab in ADVANCED_FLAGS:
+        basic_keys = set(gui._raw_tab_state(tab).keys())
+        overlap = basic_keys & ImmichGoGUI.ADVANCED_KEYS.get(tab, set())
+        assert not overlap, (
+            f"Tab '{tab}' simple-mode state keys collide with advanced keys: {sorted(overlap)}"
+        )
+
+
+def test_apply_form_state_migrates_legacy_picasa_advanced_keys(gui):
+    """Profiles saved before the picasa advanced-key rename still restore."""
+    rows = gui.adv_rows["upload-picasa"]
+    try:
+        gui.apply_form_state({
+            "fields": {},
+            "advanced": {
+                "upload-picasa": {
+                    "folder-album": {"enabled": True, "value": "PATH"},
+                    "into-album": {"enabled": True, "value": "Old Album"},
+                }
+            },
+        })
+
+        folder_state = rows["folder-as-album"].state()
+        assert folder_state["enabled"] is True
+        assert folder_state["value"] == "PATH"
+
+        into_state = rows["import-into-album"].state()
+        assert into_state["enabled"] is True
+        assert into_state["value"] == "Old Album"
+    finally:
+        rows["folder-as-album"].set_state({"enabled": False, "value": "NONE"})
+        rows["import-into-album"].set_state({"enabled": False, "value": ""})

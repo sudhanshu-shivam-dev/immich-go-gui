@@ -79,7 +79,7 @@ from core.process_tracker import (
 from core.terminal_launcher import launch_external_terminal, LaunchResult
 
 
-from core.advanced_flags import ADVANCED_FLAGS
+from core.advanced_flags import ADVANCED_FLAGS, LEGACY_ADVANCED_KEY_ALIASES
 from core import (
     AppConfig,
     BINARY_BASE_DIR,
@@ -2290,9 +2290,13 @@ class ImmichGoGUI(QMainWindow):
         if isinstance(advanced_state, dict):
             for tab_key, tab_adv in advanced_state.items():
                 rows = getattr(self, "adv_rows", {}).get(tab_key, {})
+                aliases = LEGACY_ADVANCED_KEY_ALIASES.get(tab_key, {})
                 if isinstance(tab_adv, dict):
                     for k, row_state in tab_adv.items():
                         row = rows.get(k)
+                        if row is None and k in aliases and aliases[k] not in tab_adv:
+                            # Saved before the key rename — map to the new key.
+                            row = rows.get(aliases[k])
                         if row is not None and isinstance(row_state, dict):
                             row.set_state(row_state)
 
@@ -2548,6 +2552,7 @@ class ImmichGoGUI(QMainWindow):
             return {
                 "path": get_text("path"),
                 "folder-album": get_combo("folder-album", "NONE"),
+                "into-album": get_text("into-album"),
                 "manage-burst": get_combo("manage-burst", "NoStack"),
                 "manage-raw-jpeg": get_combo("manage-raw-jpeg", "NoStack"),
                 "manage-heic-jpeg": get_combo("manage-heic-jpeg", "NoStack"),

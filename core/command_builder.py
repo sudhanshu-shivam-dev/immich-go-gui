@@ -474,6 +474,9 @@ def build_plan_from_state(
         if tab_state.get("folder-album", "NONE") != "NONE":
             emitter.add_option("folder-as-album", tab_state["folder-album"])
 
+        if str(tab_state.get("into-album", "")).strip():
+            emitter.add_option("into-album", str(tab_state["into-album"]).strip())
+
         if tab_state.get("manage-burst", "NoStack") != "NoStack":
             emitter.add_option("manage-burst", tab_state["manage-burst"])
             mb = tab_state["manage-burst"]
@@ -533,6 +536,12 @@ def build_plan_from_state(
             path_opt.extend(collect_paths(raw_path))
 
     elif tab_key == "upload-picasa":
+        if tab_state.get("folder-album", "NONE") != "NONE":
+            emitter.add_option("folder-as-album", tab_state["folder-album"])
+
+        if str(tab_state.get("into-album", "")).strip():
+            emitter.add_option("into-album", str(tab_state["into-album"]).strip())
+
         if tab_state.get("manage-burst", "NoStack") != "NoStack":
             emitter.add_option("manage-burst", tab_state["manage-burst"])
         if tab_state.get("manage-raw-jpeg", "NoStack") != "NoStack":
