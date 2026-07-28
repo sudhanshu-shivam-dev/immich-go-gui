@@ -741,7 +741,9 @@ ADVANCED_FLAGS: dict[str, tuple[AdvancedFlagDef, ...]] = {
             placeholder="YYYY-MM-DD,YYYY-MM-DD",
         ),
         AdvancedFlagDef(
-            key="folder-album",
+            # Key must not collide with the simple-mode "folder-album" tab-state
+            # key, otherwise the simple widget value is stripped in simple mode.
+            key="folder-as-album",
             flag="folder-as-album",
             label="Folder as album mode",
             kind="enum",
@@ -763,7 +765,9 @@ ADVANCED_FLAGS: dict[str, tuple[AdvancedFlagDef, ...]] = {
             placeholder=" / ",
         ),
         AdvancedFlagDef(
-            key="into-album",
+            # Key must not collide with the simple-mode "into-album" tab-state
+            # key, otherwise the simple widget value is stripped in simple mode.
+            key="import-into-album",
             flag="into-album",
             label="Import all files into album",
             kind="text",
@@ -1445,6 +1449,17 @@ ADVANCED_FLAGS: dict[str, tuple[AdvancedFlagDef, ...]] = {
             default="INFO",
         ),
     ),
+}
+
+
+# Advanced-flag state keys that were renamed because they collided with
+# simple-mode tab-state keys. Maps tab -> {legacy key: current key} so saved
+# profiles created before the rename still restore.
+LEGACY_ADVANCED_KEY_ALIASES: dict[str, dict[str, str]] = {
+    "upload-picasa": {
+        "folder-album": "folder-as-album",
+        "into-album": "import-into-album",
+    },
 }
 
 
