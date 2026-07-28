@@ -51,6 +51,15 @@ def _quote_sh_env_val(val: str) -> str:
     return "'" + val.replace("'", "'\"'\"'") + "'"
 
 
+def _escape_bat_text(text: str) -> str:
+    """Escapes % so cmd treats the text literally in a .bat file.
+
+    Inside a batch file cmd expands %NAME%, %1 and collapses %% during
+    parsing, silently rewriting arguments/paths that contain %.
+    """
+    return text.replace("%", "%%")
+
+
 def launch_external_terminal(
     command: list[str],
     env: dict[str, str],
@@ -61,19 +70,28 @@ def launch_external_terminal(
     if not command:
         return LaunchResult(ok=False, message="Empty command passed to terminal launcher.")
 
+    # The generated scripts cd away from the GUI's working directory before
+    # invoking the binary, so a relative binary path (e.g. "./immich-go")
+    # must be resolved to an absolute one first.
+    command = [os.path.abspath(command[0])] + list(command[1:])
+
     l_path = Path(lock_path).resolve()
 
     if sys.platform.startswith("win"):
         # Windows console execution
         try:
-            cmd_str = subprocess.list2cmdline(command)
+            cmd_str = _escape_bat_text(subprocess.list2cmdline(command))
             bat_path = l_path.with_suffix(".bat")
             hb_path = l_path.with_suffix(".heartbeat")
             bat_content = (
+                # The bat is written UTF-8, but cmd reads it in the OEM
+                # codepage by default — switch to UTF-8 first so non-ASCII
+                # paths (e.g. C:\Users\Müller) survive.
+                f"@chcp 65001 >nul\r\n"
                 f"@echo off\r\n"
                 f'cd /d "%~dp0"\r\n'
-                f'set "LOCK_FILE={l_path}"\r\n'
-                f'set "HB_FILE={hb_path}"\r\n'
+                f'set "LOCK_FILE={_escape_bat_text(str(l_path))}"\r\n'
+                f'set "HB_FILE={_escape_bat_text(str(hb_path))}"\r\n'
                 f'start /b cmd /c "for /L %%i in (1,1,999999) do ('
                 f'type nul > "%HB_FILE%" 2>nul & '
                 f'timeout /t 10 /nobreak >nul & '
@@ -127,8 +145,18 @@ def launch_external_terminal(
         hb_file_path = l_path.with_suffix(".heartbeat")
 
         cmd_quoted = " ".join(shlex.quote(c) for c in command)
+        env_exports = ""
+        if sys.platform == "darwin":
+            # Terminal.app does not inherit the Popen environment, so the
+            # IMMICH_GO_* variables must be exported inside the script itself
+            # or immich-go runs without credentials.
+            env_exports = "".join(
+                f"export {name}={_quote_sh_env_val(val)}\n"
+                for name, val in env.items()
+            )
         run_sh_content = (
             "#!/usr/bin/env bash\n"
+            f"{env_exports}"
             f"PID_FILE={shlex.quote(str(pid_file_path))}\n"
             f"HB_FILE={shlex.quote(str(hb_file_path))}\n"
             f"LOCK_FILE={shlex.quote(str(l_path))}\n"
@@ -165,7 +193,12 @@ def launch_external_terminal(
         )
 
         run_sh_content = run_sh_content.rstrip() + "\n"
-        run_sh_path.write_text(run_sh_content, encoding="utf-8")
+        # Create the script 0700 (inside the private 0700 run dir) BEFORE its
+        # contents are written, so secrets never sit in a file that other
+        # local users could read.
+        fd = os.open(str(run_sh_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(run_sh_content)
         if os.name == "posix":
             try:
                 os.chmod(run_sh_path, 0o700)
