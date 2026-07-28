@@ -3252,3 +3252,204 @@ def test_gui_state_reset_part_two(gui):
     assert row.get_value() == ""
     assert gui.app_config.server_url == ""
     assert gui._last_conn_test_ok is None
+
+
+# ==============================================================================
+# SECTION: TERMINAL LAUNCHER PLATFORM SCRIPT-CONTENT TESTS
+# Regression tests for platform-specific script generation:
+#   - darwin: env vars must be exported inside run.sh (Terminal.app does not
+#     inherit the Popen environment)
+#   - win32: .bat must switch to UTF-8 (chcp 65001) and escape % in every
+#     interpolated string
+#   - all: binary path must be absolute (scripts cd away before invoking it)
+# No real terminal is spawned — subprocess.Popen is mocked and the generated
+# script content is inspected.
+# ==============================================================================
+
+
+class TestLauncherScriptGeneration:
+
+    def _make_lock(self, directory):
+        lock_path = directory / "run_test.lock"
+        lock_path.write_text('{"run_id": "test"}', encoding="utf-8")
+        return lock_path
+
+    def _find_run_sh(self, temp_root):
+        candidates = list(Path(temp_root).glob("immich-go-run-*/run.sh"))
+        assert candidates, "Expected launcher to create a run.sh in the temp run dir"
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def test_darwin_script_exports_env_vars(self, tmp_path, monkeypatch):
+        """macOS: secrets must be exported inside run.sh, correctly quoted.
+
+        Terminal.app does not inherit the environment passed to Popen, so
+        without export lines in the script immich-go runs unauthenticated.
+        """
+        import shutil
+        import subprocess as _sp
+
+        monkeypatch.setattr("sys.platform", "darwin")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        lock_path = self._make_lock(tmp_path)
+
+        tricky_val = "it's a 'secret' key"
+        env = {
+            "IMMICH_GO_UPLOAD_SERVER": "http://localhost:2283",
+            "IMMICH_GO_UPLOAD_API_KEY": tricky_val,
+        }
+
+        from core.terminal_launcher import launch_external_terminal
+
+        with patch("subprocess.Popen") as mock_popen:
+            res = launch_external_terminal(
+                ["./immich-go", "upload", "from-folder", "/photos"], env, lock_path
+            )
+
+        assert res.ok
+        assert mock_popen.called
+        run_sh = self._find_run_sh(tmp_path)
+        content = run_sh.read_text(encoding="utf-8")
+
+        assert "export IMMICH_GO_UPLOAD_SERVER='http://localhost:2283'" in content
+        assert "export IMMICH_GO_UPLOAD_API_KEY=" in content
+
+        # The script (which contains secrets) must be private. POSIX-only:
+        # Windows filesystems do not carry POSIX permission bits.
+        if os.name == "posix":
+            assert run_sh.stat().st_mode & 0o777 == 0o700
+
+        # Round-trip the export lines through a real shell to prove that a
+        # value with single quotes and spaces survives the quoting.
+        export_lines = [
+            line for line in content.splitlines() if line.startswith("export IMMICH_GO_")
+        ]
+        assert len(export_lines) == 2
+        if shutil.which("bash"):
+            out = _sp.run(
+                ["bash", "-c", "\n".join(export_lines) + '\nprintf %s "$IMMICH_GO_UPLOAD_API_KEY"'],
+                capture_output=True,
+                text=True,
+            )
+            assert out.returncode == 0
+            assert out.stdout == tricky_val
+
+    def test_linux_script_has_no_export_lines(self, tmp_path, monkeypatch):
+        """Linux terminals inherit the Popen env — secrets stay out of run.sh."""
+        monkeypatch.setattr("sys.platform", "linux")
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        lock_path = self._make_lock(tmp_path)
+
+        from core.terminal_launcher import launch_external_terminal
+
+        with patch("subprocess.Popen") as mock_popen, \
+                patch("shutil.which", return_value="/usr/bin/gnome-terminal"):
+            res = launch_external_terminal(
+                ["./immich-go", "upload", "from-folder", "/photos"],
+                {"IMMICH_GO_UPLOAD_API_KEY": "secret_key_123"},
+                lock_path,
+            )
+
+        assert res.ok
+        content = self._find_run_sh(tmp_path).read_text(encoding="utf-8")
+        assert "export IMMICH_GO_" not in content
+        assert "secret_key_123" not in content
+
+    def test_windows_bat_starts_with_chcp_utf8(self, tmp_path, monkeypatch):
+        """win32: cmd reads .bat files in the OEM codepage; the UTF-8-written
+        bat must switch to codepage 65001 first or non-ASCII paths mojibake."""
+        monkeypatch.setattr("sys.platform", "win32")
+        lock_path = self._make_lock(tmp_path)
+
+        from core.terminal_launcher import launch_external_terminal
+
+        with patch("subprocess.Popen") as mock_popen:
+            mock_popen.return_value.pid = 1234
+            res = launch_external_terminal(
+                ["immich-go.exe", "upload", "from-folder", "C:\\Users\\Müller\\Fotos"],
+                {},
+                lock_path,
+            )
+
+        assert res.ok
+        bat_content = lock_path.with_suffix(".bat").read_text(encoding="utf-8")
+        first_line = bat_content.splitlines()[0]
+        assert first_line == "@chcp 65001 >nul"
+
+    def test_windows_bat_escapes_percent_everywhere(self, tmp_path, monkeypatch):
+        """win32: % in arguments and paths must be doubled, otherwise cmd
+        expands %NAME%/%1 and collapses %% when running the .bat."""
+        monkeypatch.setattr("sys.platform", "win32")
+        percent_dir = tmp_path / "100% backup"
+        percent_dir.mkdir()
+        lock_path = self._make_lock(percent_dir)
+
+        from core.terminal_launcher import launch_external_terminal
+
+        with patch("subprocess.Popen") as mock_popen:
+            mock_popen.return_value.pid = 1234
+            res = launch_external_terminal(
+                ["immich-go.exe", "upload", "from-folder", "C:\\photos\\100%NAME%\\shot%1.jpg"],
+                {},
+                lock_path,
+            )
+
+        assert res.ok
+        bat_content = lock_path.with_suffix(".bat").read_text(encoding="utf-8")
+
+        # Command arguments: every % doubled.
+        assert "100%%NAME%%" in bat_content
+        assert "shot%%1.jpg" in bat_content
+        assert "100%NAME%\\shot%1.jpg" not in bat_content
+
+        # Lock/heartbeat paths interpolated into `set` lines: % doubled too.
+        assert "100%% backup" in bat_content
+        for line in bat_content.splitlines():
+            if line.startswith('set "LOCK_FILE=') or line.startswith('set "HB_FILE='):
+                assert "100% backup" not in line
+
+        # Intentional batch syntax is left alone.
+        assert 'del /f "%LOCK_FILE%"' in bat_content
+        assert 'del /f "%HB_FILE%"' in bat_content
+        assert "for /L %%i" in bat_content
+
+    @pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+    def test_scripts_use_absolute_binary_path(self, tmp_path, monkeypatch, platform):
+        """The scripts cd away from the GUI's cwd before running, so a
+        relative binary path like ./immich-go must be written as absolute."""
+        import shlex
+        import subprocess as _sp
+
+        monkeypatch.setattr("sys.platform", platform)
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        lock_path = self._make_lock(tmp_path)
+        expected_binary = os.path.join(str(tmp_path), "immich-go")
+
+        from core.terminal_launcher import launch_external_terminal
+
+        with patch("subprocess.Popen") as mock_popen, \
+                patch("shutil.which", return_value="/usr/bin/gnome-terminal"):
+            mock_popen.return_value.pid = 1234
+            res = launch_external_terminal(
+                ["./immich-go", "upload", "from-folder", "/photos"], {}, lock_path
+            )
+
+        assert res.ok
+        # Build the expected command line exactly the way the launcher does,
+        # so the test holds on any host OS (shlex.quote wraps Windows-style
+        # absolute paths in quotes; list2cmdline does not).
+        if platform == "win32":
+            content = lock_path.with_suffix(".bat").read_text(encoding="utf-8")
+            expected_line = _sp.list2cmdline(
+                [expected_binary, "upload", "from-folder", "/photos"]
+            ).replace("%", "%%")
+        else:
+            content = self._find_run_sh(tmp_path).read_text(encoding="utf-8")
+            expected_line = " ".join(
+                shlex.quote(c)
+                for c in [expected_binary, "upload", "from-folder", "/photos"]
+            )
+        lines = content.splitlines()
+
+        assert expected_line in lines
+        assert "./immich-go upload from-folder /photos" not in lines
