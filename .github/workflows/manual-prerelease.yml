@@ -56,7 +56,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
 
       - name: Install dependencies & dev tools
         run: uv sync --dev
@@ -88,7 +88,7 @@ jobs:
               MAJOR=${BASH_REMATCH[1]}
               MINOR=${BASH_REMATCH[2]}
               PATCH=${BASH_REMATCH[3]}
-              
+
               case "${{ github.event.inputs.version_type }}" in
                 "major")
                   BASE_VER="v$((MAJOR + 1)).0.0"

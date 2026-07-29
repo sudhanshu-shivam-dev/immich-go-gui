@@ -2,6 +2,8 @@
 
 Thank you for helping improve Immich-Go GUI. Clear PRs and docs keep the project healthy for users and maintainers alike.
 
+> When browsing on GitHub at the repository root, open [docs/CONTRIBUTING.md](https://github.com/shitan198u/immich-go-gui/blob/staging/docs/CONTRIBUTING.md) (or the [published docs](https://shitan198u.github.io/immich-go-gui/CONTRIBUTING/)) so internal doc links resolve correctly.
+
 ## Where do I go from here?
 
 If you've noticed a bug or have a feature request, check for an existing [issue](https://github.com/shitan198u/immich-go-gui/issues) first. If none exists, open one with the provided templates.
@@ -119,7 +121,7 @@ Do not open routine feature PRs directly against `master`.
 - **`core/` is Qt-free.** Business logic stays testable without a display server.
 - **Secrets never go in argv.** Use env delivery via `build_environment()`.
 - **Serverless archive tabs** must never emit `--server`, `--api-key`, or `--client-timeout`.
-- **Flag allowlists** in `TAB_ALLOWED_FLAGS` are the source of truth for what each tab may emit.
+- **Flag definitions** in `core/flags.toml` are the source of truth for what each tab may emit (`flag_registry.py` loads them; `cli_schema` / `advanced_flags` are shims). Each flag has `mode = "simple"` (emit when widget value ≠ default) or `mode = "advanced"` (emit when the advanced row is enabled). Optional flags are opt-in only.
 - Prefer small PRs with tests over large unscoped rewrites.
 
 ## Building executables (optional)
@@ -129,26 +131,28 @@ Local Nuitka smoke builds:
 **Windows:**
 
 ```bash
-uv run python -m nuitka --assume-yes-for-downloads --onefile --windows-console-mode=disable --enable-plugin=pyside6 --include-data-files=immich-go-gui.png=immich-go-gui.png app.py
+uv run python -m nuitka --assume-yes-for-downloads --standalone --enable-plugin=pyside6 --output-filename=Immich-Go-GUI.exe --include-data-files=immich-go-gui.png=immich-go-gui.png --include-data-files=core/flags.toml=core/flags.toml --include-data-dir=assets=assets --include-data-dir=core/fixtures=core/fixtures --windows-console-mode=disable --windows-icon-from-ico=immich-go-gui.ico app.py
 ```
 
 **macOS:**
 
 ```bash
-uv run python -m nuitka --assume-yes-for-downloads --macos-create-app-bundle --enable-plugin=pyside6 --include-data-files=immich-go-gui.png=immich-go-gui.png app.py
+uv run python -m nuitka --assume-yes-for-downloads --macos-create-app-bundle --enable-plugin=pyside6 --include-data-files=immich-go-gui.png=immich-go-gui.png --include-data-files=core/flags.toml=core/flags.toml --include-data-dir=assets=assets --include-data-dir=core/fixtures=core/fixtures app.py
 ```
 
 **Linux:**
 
 ```bash
-uv run python -m nuitka --assume-yes-for-downloads --standalone --enable-plugin=pyside6 --include-data-files=immich-go-gui.png=immich-go-gui.png app.py
+uv run python -m nuitka --assume-yes-for-downloads --standalone --enable-plugin=pyside6 --include-data-files=immich-go-gui.png=immich-go-gui.png --include-data-files=core/flags.toml=core/flags.toml --include-data-dir=assets=assets --include-data-dir=core/fixtures=core/fixtures app.py
 ```
 
 Official multi-format packages are produced by `.github/workflows/release.yml`. See [CI/CD and Releases](developer-guide/ci-cd-and-releases.md).
 
 ## Documentation contributions
 
-When you change user-visible behavior, update the matching page under `docs/`:
+When you change user-visible behavior, update the matching page under `docs/`. Use **MkDocs-relative** links in docs-tracked markdown (no `docs/` prefix), matching other pages under `docs/`.
+
+| Change type | Update |
 
 | Change type | Update |
 |-------------|--------|

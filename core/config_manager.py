@@ -4,13 +4,12 @@ This module handles user-level TOML configuration files and secret providers (OS
 and plaintext secrets.toml) without PySide6 or Qt dependencies.
 """
 
-from dataclasses import dataclass
+import logging
 import os
-from pathlib import Path
-import shutil
 import sys
-import tempfile
-from typing import Optional
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 try:
     import tomllib
@@ -21,6 +20,8 @@ import keyring
 import tomli_w
 
 from .models import AppConfig
+
+_log = logging.getLogger(__name__)
 
 
 def _get_keyring():
@@ -65,15 +66,21 @@ class SecretStore:
         # Legacy compatibility for default profile api_key
         if profile_name == "default" and key == "api_key":
             try:
-                legacy_val = _get_keyring().get_password(SecretStore.SERVICE_NAME, "immich_api_key")
+                legacy_val = _get_keyring().get_password(
+                    SecretStore.SERVICE_NAME, "immich_api_key"
+                )
                 if legacy_val:
                     # Non-destructive migration
                     if SecretStore.set_secret("default", "api_key", legacy_val):
                         # Verify read back before deleting old key
-                        verified = _get_keyring().get_password(SecretStore.SERVICE_NAME, user)
+                        verified = _get_keyring().get_password(
+                            SecretStore.SERVICE_NAME, user
+                        )
                         if verified == legacy_val:
                             try:
-                                _get_keyring().delete_password(SecretStore.SERVICE_NAME, "immich_api_key")
+                                _get_keyring().delete_password(
+                                    SecretStore.SERVICE_NAME, "immich_api_key"
+                                )
                             except Exception:
                                 pass
                     return legacy_val
@@ -157,6 +164,7 @@ def default_config_path(profile_name: str | None = None) -> Path:
         return Path(env_override)
 
     from .profile_manager import active_profile_name, profile_config_path
+
     target_profile = profile_name or active_profile_name()
     return profile_config_path(target_profile)
 
@@ -164,65 +172,57 @@ def default_config_path(profile_name: str | None = None) -> Path:
 def default_secrets_path(profile_name: str | None = None) -> Path:
     """Returns the path to secrets.toml file for the given or active profile."""
     from .profile_manager import active_profile_name, profile_secrets_path
+
     target_profile = profile_name or active_profile_name()
     return profile_secrets_path(target_profile)
 
 
 def _atomic_write_text(path: Path, text: str, mode: int | None = None) -> None:
-    """Atomically writes text to path and optionally sets POSIX permissions.
-
-    The temporary file is created in the target directory with an unpredictable
-    name and 0600 permissions from the start (via tempfile.mkstemp), then
-    flushed and fsynced before os.replace so concurrent readers never observe
-    partial content and a crash cannot leave a corrupt target.
-    """
+    """Atomically writes text to path and optionally sets POSIX permissions."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    tmp = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
 
-        if mode is not None and os.name == "posix":
-            try:
-                os.chmod(tmp, mode)
-            except OSError:
-                pass
-
-        os.replace(tmp, path)
-    except Exception:
+    if mode is not None and os.name == "posix":
         try:
-            tmp.unlink()
+            os.chmod(tmp, mode)
         except OSError:
             pass
-        raise
+
+    os.replace(tmp, path)
 
 
-def _backup_corrupt_file(path: Path) -> Path | None:
-    """Backs up an unreadable file alongside itself so a later save cannot destroy it.
-
-    An existing backup is never overwritten: the first backup is the one most
-    likely to still hold recoverable user data. Returns the backup path, or
-    None if the backup could not be created.
-    """
-    backup = path.with_name(path.name + ".corrupt")
+def _quarantine_corrupt_file(path: Path) -> None:
+    """Rename a corrupt file with a timestamp suffix for later inspection."""
+    if not path.exists():
+        return
+    stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    corrupt_path = path.with_suffix(path.suffix + f".corrupt-{stamp}")
     try:
-        if not backup.exists():
-            shutil.copy2(path, backup)
-        return backup
+        path.rename(corrupt_path)
     except OSError:
-        return None
+        pass
+
+
+_config_load_warning: str | None = None
+
+
+def get_config_load_warning() -> str | None:
+    """Return a user-facing warning if the last load_config() quarantined a corrupt file."""
+    return _config_load_warning
 
 
 def load_config(path: Path | None = None, profile_name: str | None = None) -> AppConfig:
     """Loads configuration from user-level TOML file."""
+    global _config_load_warning
+    _config_load_warning = None
+
     if path is None:
         path = default_config_path(profile_name)
 
     cfg = AppConfig()
     from .profile_manager import active_profile_name
+
     cfg.profile_name = profile_name or active_profile_name()
 
     if not path.exists():
@@ -231,13 +231,13 @@ def load_config(path: Path | None = None, profile_name: str | None = None) -> Ap
     try:
         content = path.read_text(encoding="utf-8")
         data = tomllib.loads(content)
-    except Exception:
-        # The file exists but is unreadable/corrupt: preserve it next to the
-        # original before any subsequent save can overwrite it, and flag the
-        # condition so the GUI can inform the user.
-        backup = _backup_corrupt_file(path)
-        cfg.load_failed = True
-        cfg.load_backup_path = str(backup) if backup else ""
+    except Exception as exc:
+        _log.warning("Failed to parse config %s: %s", path, exc)
+        _quarantine_corrupt_file(path)
+        _config_load_warning = (
+            f"Configuration file at {path} could not be parsed and was renamed. "
+            "Default settings have been loaded."
+        )
         return cfg
 
     cfg.schema_version = data.get("schema_version", 2)
@@ -255,28 +255,18 @@ def load_config(path: Path | None = None, profile_name: str | None = None) -> Ap
     sec = data.get("secrets", {})
     cfg.secrets_provider = sec.get("provider", "keyring")
 
-    adv = data.get("advanced", {})
-    cfg.client_timeout_minutes = adv.get("client_timeout_minutes", 20)
-    cfg.concurrent_tasks = adv.get("concurrent_tasks", 0)
-    cfg.device_uuid = adv.get("device_uuid", "")
-
-    oe = adv.get("on_errors", "stop")
-    cfg.on_errors = "custom" if oe in ("custom", "custom…") else oe
-    cfg.on_errors_tolerance = adv.get("on_errors_tolerance", 10)
-    cfg.pause_immich_jobs = adv.get("pause_immich_jobs", True)
-
     cfg.form_state = data.get("form_state", {})
 
     return cfg
 
 
-def save_config(config: AppConfig, path: Path | None = None, profile_name: str | None = None) -> None:
+def save_config(
+    config: AppConfig, path: Path | None = None, profile_name: str | None = None
+) -> None:
     """Saves AppConfig to user-level TOML file."""
     target_prof = profile_name or config.profile_name
     if path is None:
         path = default_config_path(target_prof)
-
-    on_errors_val = "custom" if config.on_errors in ("custom", "custom…") else config.on_errors
 
     data = {
         "schema_version": 2,
@@ -292,14 +282,6 @@ def save_config(config: AppConfig, path: Path | None = None, profile_name: str |
         },
         "secrets": {
             "provider": config.secrets_provider,
-        },
-        "advanced": {
-            "client_timeout_minutes": config.client_timeout_minutes,
-            "concurrent_tasks": config.concurrent_tasks,
-            "device_uuid": config.device_uuid,
-            "on_errors": on_errors_val,
-            "on_errors_tolerance": config.on_errors_tolerance,
-            "pause_immich_jobs": config.pause_immich_jobs,
         },
         "form_state": config.form_state or {},
     }
@@ -319,7 +301,9 @@ def load_secrets(path: Path | None = None) -> dict:
     try:
         content = path.read_text(encoding="utf-8")
         return tomllib.loads(content)
-    except Exception:
+    except Exception as exc:
+        _log.warning("Failed to parse secrets %s: %s", path, exc)
+        _quarantine_corrupt_file(path)
         return {}
 
 
@@ -339,7 +323,9 @@ def get_secret_with_fallback(
     secrets_path: Path | None = None,
 ) -> str:
     """Resolves secret using environment overrides and provider settings."""
-    env_var = "IMMICH_GO_GUI_API_KEY" if key == "api_key" else "IMMICH_GO_GUI_ADMIN_API_KEY"
+    env_var = (
+        "IMMICH_GO_GUI_API_KEY" if key == "api_key" else "IMMICH_GO_GUI_ADMIN_API_KEY"
+    )
     env_val = os.environ.get(env_var, "").strip()
     if env_val:
         return env_val
@@ -350,7 +336,7 @@ def get_secret_with_fallback(
         if val:
             return val
         return SecretStore.get_secret(profile_name, key)
-    else: # keyring provider
+    else:  # keyring provider
         val = SecretStore.get_secret(profile_name, key)
         if val:
             return val
@@ -389,7 +375,7 @@ def save_secret_with_fallback(
             provider_used="config",
             message="OS keyring is unavailable. Secret was saved to local secrets file instead.",
         )
-    else: # provider == "config"
+    else:  # provider == "config"
         secrets = load_secrets(secrets_path)
         secrets[key] = value
         save_secrets(secrets, secrets_path)
@@ -400,7 +386,9 @@ def save_secret_with_fallback(
 def get_api_key(config: AppConfig | None = None) -> str:
     """Resolves API key according to secret policy (backwards-compatible wrapper)."""
     provider = config.secrets_provider if config else "keyring"
-    return get_secret_with_fallback(profile_name="default", key="api_key", provider=provider)
+    return get_secret_with_fallback(
+        profile_name="default", key="api_key", provider=provider
+    )
 
 
 def clear_api_key(config: AppConfig | None = None) -> None:

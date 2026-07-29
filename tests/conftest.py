@@ -1,84 +1,103 @@
-"""Shared fixtures keeping the test suite hermetic.
+"""Shared pytest fixtures for Immich-Go GUI test suite."""
 
-Every test runs against a per-session temporary home directory and an
-in-memory keyring backend, so the suite never reads or writes the real
-user config (config.toml, secrets.toml), run locks, or the OS keyring.
+from unittest.mock import MagicMock, patch
 
-core/config_manager.py resolves the config directory from
-IMMICH_GO_GUI_CONFIG, then XDG_CONFIG_HOME / APPDATA / HOME (see
-default_config_dir), and core/process_tracker.py derives the lock
-directory from it — so redirecting those environment variables keeps all
-on-disk state inside the temporary directory.
-"""
-
-import keyring
-import keyring.backend
-import keyring.errors
 import pytest
+from PySide6.QtWidgets import QApplication, QMessageBox
+
+from gui import ImmichGoGUI
 
 
-class InMemoryKeyring(keyring.backend.KeyringBackend):
-    """Volatile keyring backend so tests never touch the OS keyring."""
-
-    priority = 1
-
-    def __init__(self):
-        super().__init__()
-        self.store = {}
-
-    def get_password(self, service, username):
-        return self.store.get((service, username))
-
-    def set_password(self, service, username, password):
-        self.store[(service, username)] = password
-
-    def delete_password(self, service, username):
-        if (service, username) not in self.store:
-            raise keyring.errors.PasswordDeleteError(username)
-        del self.store[(service, username)]
+def _norm_argv(argv):
+    normed = []
+    for arg in argv:
+        clean = str(arg).replace("\\", "/")
+        if "=" in clean:
+            key, val = clean.split("=", 1)
+            if len(val) >= 2 and val[1] == ":" and val[0].isalpha():
+                val = val[2:]
+            clean = f"{key}={val}"
+        else:
+            if len(clean) >= 2 and clean[1] == ":" and clean[0].isalpha():
+                clean = clean[2:]
+        normed.append(clean)
+    return normed
 
 
 @pytest.fixture(scope="session")
-def isolated_home(tmp_path_factory):
-    """Per-session temporary directory standing in for the user's home."""
-    return tmp_path_factory.mktemp("isolated-home")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    yield app
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _isolated_environment(isolated_home):
-    """Redirects HOME/XDG/config paths and installs the in-memory keyring."""
-    mp = pytest.MonkeyPatch()
-    mp.setenv("HOME", str(isolated_home))
-    mp.setenv("USERPROFILE", str(isolated_home))
-    mp.setenv("XDG_CONFIG_HOME", str(isolated_home / ".config"))
-    mp.setenv("XDG_DATA_HOME", str(isolated_home / ".local" / "share"))
-    mp.setenv("APPDATA", str(isolated_home / "AppData" / "Roaming"))
-    # Ambient overrides on the developer machine must not leak into tests.
-    mp.delenv("IMMICH_GO_GUI_CONFIG", raising=False)
-    mp.delenv("IMMICH_GO_GUI_API_KEY", raising=False)
-    mp.delenv("IMMICH_GO_GUI_ADMIN_API_KEY", raising=False)
+@pytest.fixture(scope="session")
+def gui(qapp):
+    """One shared window for the whole suite.
 
-    previous_backend = keyring.get_keyring()
-    keyring.set_keyring(InMemoryKeyring())
-    try:
-        yield
-    finally:
-        keyring.set_keyring(previous_backend)
-        mp.undo()
-
-
-@pytest.fixture
-def fake_keyring(_isolated_environment):
-    """Returns the active in-memory keyring backend."""
-    backend = keyring.get_keyring()
-    assert isinstance(backend, InMemoryKeyring)
-    return backend
+    Session teardown must not show Save/Discard dialogs: function-scoped
+    monkeypatches are already gone when this fixture exits. Use _force_close.
+    """
+    with (
+        patch.object(ImmichGoGUI, "check_binary_version"),
+        patch.object(ImmichGoGUI, "load_configuration"),
+        patch.object(ImmichGoGUI, "_probe_keyring", return_value=True),
+        patch("PySide6.QtWidgets.QMessageBox.warning"),
+        patch(
+            "PySide6.QtWidgets.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Discard,
+        ),
+    ):
+        g = ImmichGoGUI()
+        g.binary_path = "./immich-go"
+        # Never fire silent connection tests during the suite — they hit the
+        # network with a 4s timeout and dominate wall time when Qt processes events.
+        if hasattr(g, "_conn_test_debounce"):
+            g._conn_test_debounce.stop()
+            g._conn_test_debounce.timeout.disconnect()
+        g._auto_test_connection = lambda: None
+        g._mark_configuration_clean()
+        yield g
+        g._force_close = True
+        g.close()
 
 
 @pytest.fixture(autouse=True)
-def _fresh_keyring_store():
-    """Clears the in-memory keyring before each test."""
-    backend = keyring.get_keyring()
-    if isinstance(backend, InMemoryKeyring):
-        backend.store.clear()
+def suppress_qt_dialogs(monkeypatch):
+    """Suppress modal QMessageBox dialogs during each test function."""
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.information", MagicMock())
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.warning", MagicMock())
+    monkeypatch.setattr("PySide6.QtWidgets.QMessageBox.critical", MagicMock())
+    # Discard: close-without-save path. Lock-prompt tests that need Yes override this.
+    monkeypatch.setattr(
+        "PySide6.QtWidgets.QMessageBox.question",
+        MagicMock(return_value=QMessageBox.StandardButton.Discard),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clear_profiles_cache():
+    from core.profile_manager import clear_profiles_cache
+
+    clear_profiles_cache()
     yield
+    clear_profiles_cache()
+
+
+@pytest.fixture(autouse=True)
+def _reset_shared_config(gui):
+    cfg = gui.inputs["config"]
+    cfg["skip-ssl"].setChecked(False)
+    if cfg.get("server"):
+        cfg["server"].clear()
+    gui._mark_configuration_clean()
+    yield
+    gui.toggle_advanced(False)
+    if hasattr(gui, "reset_advanced_flags"):
+        gui.reset_advanced_flags()
+    picasa = gui.inputs.get("upload-picasa", {})
+    if "folder-album" in picasa:
+        picasa["folder-album"].setCurrentIndex(0)
+    if "into-album" in picasa:
+        picasa["into-album"].clear()

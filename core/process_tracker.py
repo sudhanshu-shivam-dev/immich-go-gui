@@ -3,15 +3,15 @@
 Pure Python module, Qt-free.
 """
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 import os
-from pathlib import Path
 import sys
 import uuid
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
-from .config_manager import _atomic_write_text, default_config_dir
+from .config_manager import default_config_dir
 
 
 @dataclass
@@ -44,7 +44,7 @@ def create_lock(
     run_id = uuid.uuid4().hex[:8]
     l_path = lock_dir() / f"run_{run_id}.lock"
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(UTC).isoformat()
     data = {
         "run_id": run_id,
         "gui_pid": os.getpid(),
@@ -58,7 +58,7 @@ def create_lock(
     }
 
     text = json.dumps(data, indent=2)
-    _atomic_write_text(l_path, text, mode=0o644)
+    l_path.write_text(text, encoding="utf-8")
     return l_path
 
 
@@ -71,8 +71,8 @@ def update_lock(lock_path: Path, **fields) -> None:
         data = json.loads(p.read_text(encoding="utf-8"))
         for k, v in fields.items():
             data[k] = v
-        data["last_seen"] = datetime.now(timezone.utc).isoformat()
-        _atomic_write_text(p, json.dumps(data, indent=2), mode=0o644)
+        data["last_seen"] = datetime.now(UTC).isoformat()
+        p.write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
 
@@ -122,6 +122,7 @@ def _is_process_alive(pid: int | None) -> bool:
     if sys.platform.startswith("win"):
         try:
             import ctypes
+
             kernel32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
@@ -160,8 +161,22 @@ def is_lock_active(lock_path: Path) -> bool:
         except (ValueError, OSError):
             pass
 
-    if shell_pid and _is_process_alive(shell_pid):
+    had_shell_pid = shell_pid is not None and shell_pid > 0
+    if had_shell_pid and _is_process_alive(shell_pid):
         return True
+
+    # Dead shell PID: do not fall through to heartbeat on POSIX (orphan HB loop
+    # would keep the lock alive after the user closes the terminal).
+    if had_shell_pid and not sys.platform.startswith("win"):
+        if lock.started_at:
+            try:
+                start_dt = datetime.fromisoformat(lock.started_at)
+                now = datetime.now(UTC)
+                if (now - start_dt).total_seconds() < 60:
+                    return True
+            except ValueError:
+                pass
+        return False
 
     # 2. Check terminal_pid
     if lock.terminal_pid:
@@ -182,7 +197,7 @@ def is_lock_active(lock_path: Path) -> bool:
     if hb_file.exists():
         try:
             mtime = hb_file.stat().st_mtime
-            age = (datetime.now().timestamp() - mtime)
+            age = datetime.now().timestamp() - mtime
             if age < 60:
                 return True
         except OSError:
@@ -192,7 +207,7 @@ def is_lock_active(lock_path: Path) -> bool:
     if lock.started_at:
         try:
             start_dt = datetime.fromisoformat(lock.started_at)
-            now = datetime.now(timezone.utc)
+            now = datetime.now(UTC)
             if (now - start_dt).total_seconds() < 60:
                 return True
         except ValueError:
@@ -209,12 +224,10 @@ def scan_locks() -> list[RunLock]:
 
     active_locks = []
     for p in d.glob("run_*.lock"):
-        lock = read_lock(p)
-        if lock is None:
-            # Unparseable lock: cannot be proven stale, so leave it alone.
-            continue
         if is_lock_active(p):
-            active_locks.append(lock)
+            lock = read_lock(p)
+            if lock:
+                active_locks.append(lock)
         else:
             release_lock(p)
 
@@ -229,9 +242,6 @@ def cleanup_stale_locks() -> int:
 
     cleaned = 0
     for p in d.glob("run_*.lock"):
-        if read_lock(p) is None:
-            # Unparseable lock: cannot be proven stale, so leave it alone.
-            continue
         if not is_lock_active(p):
             release_lock(p)
             cleaned += 1
