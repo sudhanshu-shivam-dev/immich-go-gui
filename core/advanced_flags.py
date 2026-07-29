@@ -1519,6 +1519,7 @@ def apply_advanced_flags_to_plan(
     emitter: Any,
     tab_key: str,
     advanced_state: dict,
+    has_admin_key: bool = False,
 ):
     """Applies active (enabled) advanced flags to a CommandPlan and FlagEmitter."""
     from .cli_schema import flag_allowed_for_tab
@@ -1548,6 +1549,25 @@ def apply_advanced_flags_to_plan(
                 f"Flag '--{def_.flag}' is not allowed for tab '{tab_key}'"
             )
             continue
+
+        # Pausing Immich jobs without an Admin API Key causes a 403 Forbidden;
+        # the plan already suppressed it with --pause-immich-jobs=false, so the
+        # advanced row must not re-enable it.
+        if def_.flag == "pause-immich-jobs" and bool(value) and not has_admin_key:
+            plan.warnings.append(
+                "Advanced flag 'Pause Immich background jobs' ignored: no Admin "
+                "API Key is configured. Set an Admin API Key in the Configuration "
+                "tab to enable pausing of Immich background jobs during upload."
+            )
+            continue
+
+        # Advanced flags override simple-mode flags: drop any occurrence of the
+        # same flag already in the plan so argv has no contradictory duplicates.
+        bare = f"--{def_.flag}"
+        prefix = f"--{def_.flag}="
+        emitter.opts[:] = [
+            o for o in emitter.opts if o != bare and not o.startswith(prefix)
+        ]
 
         for arg in args:
             if hasattr(emitter, "add_raw_checked"):
