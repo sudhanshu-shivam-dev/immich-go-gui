@@ -2931,6 +2931,78 @@ class TestPauseJobsAutoDisable:
 
 
 # ==============================================================================
+# Advanced-flag conflict handling: advanced overrides simple-mode flags
+# ==============================================================================
+
+
+class TestAdvancedFlagConflicts:
+    """Advanced flags must replace simple-mode duplicates, not stack on top."""
+
+    _BASE_CONFIG = {
+        "server": "http://localhost:2283",
+        "api_key": "user-key",
+    }
+
+    def test_advanced_flag_overrides_simple_mode_flag_once(self):
+        """An advanced flag colliding with a simple-mode flag yields exactly one occurrence with the advanced value."""
+        plan = _build_plan(
+            tab_key="upload-folder",
+            config_state={**self._BASE_CONFIG, "admin_api_key": "admin-secret"},
+            tab_state={"path": "/photos", "log-level": "DEBUG", "on-errors": "continue"},
+            advanced_state={
+                "log-level": {"enabled": True, "value": "ERROR"},
+                "on-errors": {"enabled": True, "value": "stop"},
+            },
+        )
+        log_flags = [a for a in plan.argv if a.startswith("--log-level")]
+        assert log_flags == ["--log-level=ERROR"], f"Expected single advanced value; got: {log_flags}"
+        on_errors_flags = [a for a in plan.argv if a.startswith("--on-errors")]
+        assert on_errors_flags == ["--on-errors=stop"], f"Expected single advanced value; got: {on_errors_flags}"
+
+    def test_advanced_pause_true_without_admin_key_stays_disabled(self):
+        """No admin key: advanced pause=True must not re-enable --pause-immich-jobs (403 guard)."""
+        plan = _build_plan(
+            tab_key="upload-folder",
+            config_state={**self._BASE_CONFIG, "admin_api_key": ""},
+            tab_state={"path": "/photos"},
+            advanced_state={"pause-jobs": {"enabled": True, "value": True}},
+        )
+        pause_flags = [a for a in plan.argv if "pause-immich-jobs" in a]
+        assert pause_flags == ["--pause-immich-jobs=false"], (
+            f"Expected single --pause-immich-jobs=false; got: {pause_flags}"
+        )
+        assert any("Admin API Key" in w for w in plan.warnings), (
+            f"Expected a warning about Admin API Key; got: {plan.warnings}"
+        )
+
+    def test_advanced_pause_false_without_admin_key_single_flag(self):
+        """No admin key + advanced pause=False: identical duplicate is collapsed to one flag."""
+        plan = _build_plan(
+            tab_key="upload-folder",
+            config_state={**self._BASE_CONFIG, "admin_api_key": ""},
+            tab_state={"path": "/photos"},
+            advanced_state={"pause-jobs": {"enabled": True, "value": False}},
+        )
+        pause_flags = [a for a in plan.argv if "pause-immich-jobs" in a]
+        assert pause_flags == ["--pause-immich-jobs=false"], (
+            f"Expected single --pause-immich-jobs=false; got: {pause_flags}"
+        )
+
+    def test_advanced_pause_true_with_admin_key_overrides_simple_false(self):
+        """With an admin key, advanced pause=True replaces the simple-mode =false flag."""
+        plan = _build_plan(
+            tab_key="upload-folder",
+            config_state={**self._BASE_CONFIG, "admin_api_key": "admin-secret", "pause_jobs": False},
+            tab_state={"path": "/photos"},
+            advanced_state={"pause-jobs": {"enabled": True, "value": True}},
+        )
+        pause_flags = [a for a in plan.argv if "pause-immich-jobs" in a]
+        assert pause_flags == ["--pause-immich-jobs"], (
+            f"Expected single --pause-immich-jobs; got: {pause_flags}"
+        )
+
+
+# ==============================================================================
 # SECTION: CONFIG/PROFILE/LOCK RESILIENCE (corruption & crash safety)
 # ==============================================================================
 

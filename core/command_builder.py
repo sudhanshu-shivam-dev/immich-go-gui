@@ -650,6 +650,7 @@ def build_plan_from_state(
             emitter=emitter,
             tab_key=tab_key,
             advanced_state=advanced_state,
+            has_admin_key=bool(admin_api_key),
         )
 
     # Dry-run handling
