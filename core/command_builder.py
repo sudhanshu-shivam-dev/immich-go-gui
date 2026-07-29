@@ -21,6 +21,7 @@ from .cli_schema import (
     UPLOAD_TABS,
     flag_allowed_for_tab,
 )
+from .network import normalize_server_url
 from .validation import (
     clean_date_range,
     normalize_extensions_csv,
@@ -108,18 +109,6 @@ _DATE_RANGE_RE = re.compile(
     r"^\d{4}(-\d{2}(-\d{2})?)?"
     r"(,\d{4}(-\d{2}(-\d{2})?)?)?$"
 )
-
-
-def normalize_server_url(url: str) -> str:
-    """Normalize a server URL for CLI consumption."""
-    url = url.strip()
-    if not url:
-        return ""
-
-    if not url.startswith("http://") and not url.startswith("https://"):
-        url = "http://" + url
-
-    return url.rstrip("/")
 
 
 def collect_paths(raw_text: str) -> list[str]:
