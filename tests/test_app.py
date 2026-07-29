@@ -110,6 +110,51 @@ def test_normalize_server_url_empty():
     assert normalize_server_url("   ") == ""
 
 
+def test_normalize_server_url_defaults_public_host_to_https():
+    assert normalize_server_url("immich.example.com:2283") == "https://immich.example.com:2283"
+    assert normalize_server_url("photos.example.com/") == "https://photos.example.com"
+
+
+def test_normalize_server_url_public_ip_defaults_to_https():
+    assert normalize_server_url("198.18.0.7:2283") == "https://198.18.0.7:2283"
+    assert normalize_server_url("172.32.0.1:2283") == "https://172.32.0.1:2283"
+
+
+def test_normalize_server_url_keeps_http_for_local_hosts():
+    assert normalize_server_url("localhost:2283") == "http://localhost:2283"
+    assert normalize_server_url("127.0.0.1:2283") == "http://127.0.0.1:2283"
+    assert normalize_server_url("127.5.5.5:2283") == "http://127.5.5.5:2283"
+    assert normalize_server_url("[::1]:2283") == "http://[::1]:2283"
+    assert normalize_server_url("nas.local:2283") == "http://nas.local:2283"
+    assert normalize_server_url("10.0.0.5:2283") == "http://10.0.0.5:2283"
+    assert normalize_server_url("172.16.0.9:2283") == "http://172.16.0.9:2283"
+    assert normalize_server_url("192.168.1.20:2283") == "http://192.168.1.20:2283"
+
+
+def test_normalize_server_url_preserves_explicit_schemes():
+    assert normalize_server_url("http://photos.example.com") == "http://photos.example.com"
+    assert normalize_server_url("http://immich.example.com:2283") == "http://immich.example.com:2283"
+    assert normalize_server_url("https://localhost:2283") == "https://localhost:2283"
+
+
+@pytest.mark.parametrize("raw", [
+    "immich.example.com:2283",
+    "localhost:2283",
+    "127.0.0.1:2283",
+    "[::1]:2283",
+    "nas.local:2283",
+    "192.168.1.20:2283",
+    "198.18.0.7:2283",
+    "http://any.example.com:2283",
+    "https://any.example.com:2283/",
+    "",
+])
+def test_normalize_server_url_builder_matches_network(raw):
+    from core.command_builder import normalize_server_url as builder_normalize
+    from core.network import normalize_server_url as network_normalize
+    assert builder_normalize(raw) == network_normalize(raw)
+
+
 def test_mask_command_for_display():
     cmd = ["immich-go", "upload", "from-folder",
            "--server=http://local", "--api-key=super_secret_123", "/photos"]
