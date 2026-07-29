@@ -123,13 +123,22 @@ def normalize_server_url(url: str) -> str:
 
 
 def collect_paths(raw_text: str) -> list[str]:
-    """Expands glob patterns, expands user tildes (~), and converts relative paths to absolute paths."""
+    """Expands glob patterns, expands user tildes (~), and converts relative paths to absolute paths.
+
+    Paths that exist literally (e.g. from browse dialogs or drag-and-drop) are
+    used as-is and never glob-interpreted, even when they contain glob
+    metacharacters such as "Photos [2020]". Only lines that do not exist
+    literally are treated as glob patterns.
+    """
     paths = []
     for line in raw_text.splitlines():
         line = line.strip()
         if not line:
             continue
         expanded_user = os.path.expanduser(line)
+        if os.path.exists(expanded_user):
+            paths.append(os.path.abspath(expanded_user))
+            continue
         expanded = glob.glob(expanded_user, recursive=True)
         if expanded:
             for p in expanded:

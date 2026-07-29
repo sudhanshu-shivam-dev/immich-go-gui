@@ -55,6 +55,44 @@ def test_collect_paths_glob_expansion(tmp_path):
     assert all("takeout-" in p for p in result)
 
 
+def test_collect_paths_literal_path_with_brackets_not_globbed(tmp_path):
+    bracketed = tmp_path / "Photos [2020]"
+    bracketed.mkdir()
+    sibling = tmp_path / "Photos 2"
+    sibling.mkdir()
+
+    result = collect_paths(str(bracketed))
+    assert result == [os.path.abspath(str(bracketed))]
+    assert os.path.abspath(str(sibling)) not in result
+
+
+def test_collect_paths_bracket_glob_still_expands_when_not_literal(tmp_path):
+    (tmp_path / "Photos 1").mkdir()
+    (tmp_path / "Photos 2").mkdir()
+
+    pattern = str(tmp_path / "Photos [12]")
+    result = collect_paths(pattern)
+    assert sorted(result) == sorted([
+        os.path.abspath(str(tmp_path / "Photos 1")),
+        os.path.abspath(str(tmp_path / "Photos 2")),
+    ])
+
+
+def test_build_plan_literal_bracketed_path_not_substituted(tmp_path):
+    from core.command_builder import build_plan_from_state
+    bracketed = tmp_path / "Photos [2020]"
+    bracketed.mkdir()
+    sibling = tmp_path / "Photos 2"
+    sibling.mkdir()
+
+    config_state = {"server": "http://localhost:2283", "api_key": "test"}
+    plan = build_plan_from_state(
+        "upload-folder", config_state, {"path": str(bracketed)}
+    )
+    assert os.path.abspath(str(bracketed)) in plan.argv
+    assert os.path.abspath(str(sibling)) not in plan.argv
+
+
 def test_normalize_server_url_adds_scheme():
     assert normalize_server_url("localhost:2283") == "http://localhost:2283"
 
@@ -1104,6 +1142,31 @@ def test_glob_and_path_validation(tmp_path):
     expanded, warnings = expand_source_paths(non_existent)
     assert len(warnings) == 1
     assert "does not exist" in warnings[0]
+
+
+def test_expand_source_paths_literal_bracketed_path_not_globbed(tmp_path):
+    bracketed = tmp_path / "Photos [2020]"
+    bracketed.mkdir()
+    sibling = tmp_path / "Photos 2"
+    sibling.mkdir()
+
+    expanded, warnings = expand_source_paths(str(bracketed))
+    assert expanded == [str(bracketed)]
+    assert str(sibling) not in expanded
+    assert warnings == []
+
+
+def test_expand_source_paths_bracket_glob_still_expands_when_not_literal(tmp_path):
+    (tmp_path / "Photos 1").mkdir()
+    (tmp_path / "Photos 2").mkdir()
+
+    pattern = str(tmp_path / "Photos [12]")
+    expanded, warnings = expand_source_paths(pattern)
+    assert expanded == sorted([
+        str(tmp_path / "Photos 1"),
+        str(tmp_path / "Photos 2"),
+    ])
+    assert warnings == []
 
 
 def test_destination_validation(tmp_path):

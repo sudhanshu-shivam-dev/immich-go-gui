@@ -169,6 +169,11 @@ def expand_source_paths(raw_text: str) -> tuple[list[str], list[str]]:
     - expand globs
     - return (expanded_paths, warnings)
 
+    Paths that exist literally (e.g. from browse dialogs or drag-and-drop) are
+    used as-is and never glob-interpreted, even when they contain glob
+    metacharacters such as "Photos [2020]". Only lines that do not exist
+    literally are treated as glob patterns.
+
     Warnings:
     - non-glob line that does not exist
     - glob line that matches nothing
@@ -185,15 +190,16 @@ def expand_source_paths(raw_text: str) -> tuple[list[str], list[str]]:
         if not os.path.isabs(item):
             item = os.path.abspath(item)
 
-        if has_glob_pattern(item):
+        if os.path.exists(item):
+            expanded_paths.append(item)
+        elif has_glob_pattern(item):
             matches = glob.glob(item, recursive=True)
             if not matches:
                 warnings.append(f"Glob pattern '{line}' matched no files or directories.")
             else:
                 expanded_paths.extend(sorted(matches))
         else:
-            if not os.path.exists(item):
-                warnings.append(f"Source path '{line}' does not exist.")
+            warnings.append(f"Source path '{line}' does not exist.")
             expanded_paths.append(item)
 
     return expanded_paths, warnings
