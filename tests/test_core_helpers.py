@@ -55,6 +55,17 @@ def test_collect_paths_glob_expansion(tmp_path):
     assert all("takeout-" in p for p in result)
 
 
+def test_collect_paths_literal_path_with_glob_metacharacters(tmp_path):
+    """A real folder named like a glob pattern must never resolve to a sibling."""
+    bracketed = tmp_path / "Photos [2020]"
+    bracketed.mkdir()
+    sibling = tmp_path / "Photos 2"
+    sibling.mkdir()
+    result = collect_paths(str(bracketed))
+    assert result == [os.path.abspath(str(bracketed))]
+    assert os.path.abspath(str(sibling)) not in result
+
+
 def test_normalize_server_url_adds_scheme():
     assert normalize_server_url("localhost:2283") == "http://localhost:2283"
 
@@ -73,6 +84,30 @@ def test_normalize_server_url_preserves_https():
 def test_normalize_server_url_empty():
     assert normalize_server_url("") == ""
     assert normalize_server_url("   ") == ""
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        # Remote hosts default to https so the API key is never cleartext.
+        ("photos.example.com:2283", "https://photos.example.com:2283"),
+        ("immich.example.com", "https://immich.example.com"),
+        ("8.8.8.8:2283", "https://8.8.8.8:2283"),
+        # Clearly-local hosts keep http for home-server compatibility.
+        ("localhost:2283", "http://localhost:2283"),
+        ("127.0.0.1:2283", "http://127.0.0.1:2283"),
+        ("[::1]:2283", "http://[::1]:2283"),
+        ("192.168.1.50:2283", "http://192.168.1.50:2283"),
+        ("10.0.0.5:2283", "http://10.0.0.5:2283"),
+        ("172.16.0.2:2283", "http://172.16.0.2:2283"),
+        ("immich-server.local:2283", "http://immich-server.local:2283"),
+        # Explicit schemes are always preserved verbatim.
+        ("http://photos.example.com", "http://photos.example.com"),
+        ("https://192.168.1.50:2283", "https://192.168.1.50:2283"),
+    ],
+)
+def test_normalize_server_url_scheme_default_by_locality(url, expected):
+    assert normalize_server_url(url) == expected
 
 
 def test_mask_command_for_display():

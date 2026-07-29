@@ -4,6 +4,8 @@ Pure Python module, Qt-free.
 """
 
 from dataclasses import dataclass
+import ipaddress
+from urllib.parse import urlsplit
 
 import requests
 
@@ -16,13 +18,51 @@ class ConnectionTestResult:
     server_version: str | None = None
 
 
+_PRIVATE_LAN_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+
+def _is_local_host(url_without_scheme: str) -> bool:
+    """Return True if the URL's host clearly refers to a local machine or LAN.
+
+    Local hosts are: 'localhost', mDNS '*.local' names, loopback addresses
+    (127.0.0.0/8, ::1), and RFC 1918 private-LAN addresses (10.0.0.0/8,
+    172.16.0.0/12, 192.168.0.0/16). Anything else — including unparseable
+    hosts — is treated as remote.
+    """
+    try:
+        host = urlsplit("//" + url_without_scheme).hostname
+    except ValueError:
+        host = None
+    if not host:
+        # Bare IPv6 literals like "::1" do not parse as a netloc.
+        host = url_without_scheme.split("/", 1)[0].strip("[]").lower()
+    if host == "localhost" or host.endswith(".local"):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr.is_loopback or any(addr in net for net in _PRIVATE_LAN_NETWORKS)
+
+
 def normalize_server_url(url: str) -> str:
-    """Ensure server URL has scheme and no trailing slash."""
+    """Ensure server URL has scheme and no trailing slash.
+
+    Explicit http:// and https:// schemes are preserved verbatim. A
+    scheme-less URL defaults to https:// so the API key is never sent in
+    cleartext to a remote server; only clearly-local hosts (see
+    _is_local_host) default to http://.
+    """
     url = url.strip()
     if not url:
         return ""
     if not (url.startswith("http://") or url.startswith("https://")):
-        url = "http://" + url
+        scheme = "http://" if _is_local_host(url) else "https://"
+        url = scheme + url
     return url.rstrip("/")
 
 

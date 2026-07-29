@@ -50,6 +50,15 @@ def _quote_sh_env_val(val: str) -> str:
     return "'" + val.replace("'", "'\"'\"'") + "'"
 
 
+def _escape_bat_text(text: str) -> str:
+    """Escapes % so cmd treats the text literally in a .bat file.
+
+    Inside a batch file cmd expands %NAME%, %1 and collapses %% during
+    parsing, silently rewriting arguments/paths that contain %.
+    """
+    return text.replace("%", "%%")
+
+
 def _resolve_command_binary(command: list[str]) -> list[str]:
     """Resolve the binary path (argv[0]) to an absolute path when possible."""
     if not command:
@@ -100,14 +109,18 @@ def launch_external_terminal(
     if sys.platform.startswith("win"):
         # Windows console execution
         try:
-            cmd_str = subprocess.list2cmdline(command)
+            cmd_str = _escape_bat_text(subprocess.list2cmdline(command))
             bat_path = l_path.with_suffix(".bat")
             hb_path = l_path.with_suffix(".heartbeat")
             bat_content = (
+                # The bat is written UTF-8, but cmd reads it in the OEM
+                # codepage by default — switch to UTF-8 first so non-ASCII
+                # paths (e.g. C:\Users\Müller) survive.
+                f"@chcp 65001 >nul\r\n"
                 f"@echo off\r\n"
                 f'cd /d "%~dp0"\r\n'
-                f'set "LOCK_FILE={l_path}"\r\n'
-                f'set "HB_FILE={hb_path}"\r\n'
+                f'set "LOCK_FILE={_escape_bat_text(str(l_path))}"\r\n'
+                f'set "HB_FILE={_escape_bat_text(str(hb_path))}"\r\n'
                 f'start /b cmd /c "for /L %%i in (1,1,999999) do ('
                 f'type nul > "%HB_FILE%" 2>nul & '
                 f"timeout /t 10 /nobreak >nul & "

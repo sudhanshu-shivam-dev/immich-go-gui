@@ -221,6 +221,65 @@ def test_windows_bat_heartbeat_generation(tmp_path, monkeypatch):
     assert 'del /f "%BAT_FILE%"' not in bat_content
 
 
+def test_windows_bat_starts_with_chcp_utf8(tmp_path, monkeypatch):
+    """cmd reads .bat files in the OEM codepage; the UTF-8-written bat must
+    switch to codepage 65001 first or non-ASCII paths mojibake."""
+    from core.terminal_launcher import launch_external_terminal
+
+    monkeypatch.setattr("sys.platform", "win32")
+
+    lock_file = tmp_path / "run_test.lock"
+    lock_file.write_text('{"run_id": "test"}', encoding="utf-8")
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.pid = 1234
+        res = launch_external_terminal(["immich-go", "stack"], {}, lock_file)
+        assert res.ok
+
+    bat_content = lock_file.with_suffix(".bat").read_text(encoding="utf-8")
+    assert bat_content.splitlines()[0] == "@chcp 65001 >nul"
+
+
+def test_windows_bat_escapes_percent_everywhere(tmp_path, monkeypatch):
+    """% in arguments and paths must be doubled, otherwise cmd expands
+    %NAME%/%1 and collapses %% when running the .bat."""
+    from core.terminal_launcher import launch_external_terminal
+
+    monkeypatch.setattr("sys.platform", "win32")
+
+    percent_dir = tmp_path / "100% backup"
+    percent_dir.mkdir()
+    lock_file = percent_dir / "run_test.lock"
+    lock_file.write_text('{"run_id": "test"}', encoding="utf-8")
+
+    with patch("subprocess.Popen") as mock_popen:
+        mock_popen.return_value.pid = 1234
+        res = launch_external_terminal(
+            ["immich-go", "upload", "from-folder", "C:\\photos\\100%NAME%\\shot%1.jpg"],
+            {},
+            lock_file,
+        )
+        assert res.ok
+
+    bat_content = lock_file.with_suffix(".bat").read_text(encoding="utf-8")
+
+    # Command arguments: every % doubled.
+    assert "100%%NAME%%" in bat_content
+    assert "shot%%1.jpg" in bat_content
+    assert "100%NAME%\\shot%1.jpg" not in bat_content
+
+    # Lock/heartbeat paths interpolated into `set` lines: % doubled too.
+    for line in bat_content.splitlines():
+        if line.startswith('set "LOCK_FILE=') or line.startswith('set "HB_FILE='):
+            assert "100% backup" not in line
+            assert "100%% backup" in line
+
+    # Intentional batch syntax is left alone.
+    assert 'del /f "%LOCK_FILE%"' in bat_content
+    assert 'del /f "%HB_FILE%"' in bat_content
+    assert "for /L %%i" in bat_content
+
+
 class TestWindowsPathParsing:
     """Group A: Pure path logic tests — no filesystem access, run on any OS."""
 
